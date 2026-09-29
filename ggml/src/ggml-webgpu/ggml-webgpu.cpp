@@ -4332,6 +4332,9 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_MUL_MAT:
             {
+                if (op->type != GGML_TYPE_F32) {
+                    break;
+                }
                 switch (src1->type) {
                     case GGML_TYPE_F16:
                         supports_op |= (src0->type == GGML_TYPE_F16);

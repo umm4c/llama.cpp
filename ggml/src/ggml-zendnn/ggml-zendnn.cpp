@@ -703,6 +703,9 @@ static bool ggml_backend_zendnn_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         {
+            if (op->op == GGML_OP_MUL_MAT && op->type != GGML_TYPE_F32) {
+                return false;
+            }
             const ggml_tensor * weights = op->src[0];
             const ggml_tensor * inputs = op->src[1];
 
