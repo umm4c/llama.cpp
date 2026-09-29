@@ -1234,7 +1234,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                     (src1_cont || src1->type != vec_dot_type
                         ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
                         : (i11 * nb11 + i12 * nb12 + i13 * nb13));
-                float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
+                char * dst_col = (char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3);
 
                 //for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
                 //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
@@ -1245,7 +1245,13 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                    const int64_t count = MIN(iir0 + blck_0, ir0_end) - iir0;
+                    const int64_t offset = iir0 + cn * nb1 / nb0;
+                    if (dst->type == GGML_TYPE_F16) {
+                        ggml_fp32_to_fp16_row(tmp + cn * 16, (ggml_fp16_t *) dst_col + offset, count);
+                    } else {
+                        memcpy((float *) dst_col + offset, tmp + cn * 16, count * sizeof(float));
+                    }
                 }
             }
         }
@@ -1260,7 +1266,7 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src1 = dst->src[1];
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
-    if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
+    if (hint == GGML_HINT_SRC0_IS_HADAMARD && dst->type == GGML_TYPE_F32 && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
         return;
     }
@@ -1284,7 +1290,7 @@ void ggml_compute_forward_mul_mat(
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 
     // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT((dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16) && nb0 == ggml_type_size(dst->type));
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
@@ -1300,7 +1306,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont) {
+    if (src1_cont && dst->type == GGML_TYPE_F32) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1372,7 +1378,7 @@ UseGgmlGemm1:;
     }
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
+    if (src1->type != vec_dot_type && dst->type == GGML_TYPE_F32) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 

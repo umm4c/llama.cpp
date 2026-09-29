@@ -87,6 +87,9 @@ static bool ggml_zdnn_supports_op(const ggml_backend_zdnn_device_context * ctx_d
 
         case GGML_OP_MUL_MAT:
             {
+                if (op->type != GGML_TYPE_F32) {
+                    return false;
+                }
                 const ggml_tensor * weights = op->src[0];
                 const ggml_tensor * inputs  = op->src[1];
 

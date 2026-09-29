@@ -405,6 +405,9 @@ static bool ggml_backend_blas_device_supports_op(ggml_backend_dev_t dev, const s
 
         case GGML_OP_MUL_MAT:
         {
+            if (op->type != GGML_TYPE_F32) {
+                return false;
+            }
             // BLAS usually is only faster for large matrices
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
