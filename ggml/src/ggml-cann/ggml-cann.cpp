@@ -1376,6 +1376,37 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
     if (!need_transform(tensor->type)) {
         ACL_CHECK(aclrtMemcpy(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
     } else {
+        if (tensor->view_src || offset != 0 || size != ggml_nbytes(tensor)) {
+            // Q4_0 and Q8_0 keep all quantized values before all scales on the device.
+            // A byte range in GGML layout therefore needs two device reads before
+            // converting just the blocks covered by that range.
+            const size_t block_size = ggml_type_size(tensor->type);
+            const size_t quant_size = tensor->type == GGML_TYPE_Q8_0 ? QK8_0 : QK4_0 / 2;
+            const ggml_tensor * storage = tensor->view_src ? tensor->view_src : tensor;
+            const size_t storage_offset = tensor->view_src ? tensor->view_offs : 0;
+            const size_t start = storage_offset + offset;
+            GGML_ASSERT(start + size <= ggml_nbytes(storage));
+            const size_t first_block = start / block_size;
+            const size_t last_block  = (start + size - 1) / block_size + 1;
+            const size_t block_count = last_block - first_block;
+            const size_t quant_bytes = block_count * quant_size;
+            const size_t scale_bytes = block_count * sizeof(uint16_t);
+            const size_t all_quant_bytes = ggml_nelements(storage) / ggml_blck_size(tensor->type) * quant_size;
+            std::vector<uint8_t> transformed(quant_bytes + scale_bytes);
+            std::vector<uint8_t> restored(block_count * block_size);
+            ACL_CHECK(aclrtMemcpy(transformed.data(), quant_bytes,
+                                  (char *) storage->data + first_block * quant_size,
+                                  quant_bytes, ACL_MEMCPY_DEVICE_TO_HOST));
+            ACL_CHECK(aclrtMemcpy(transformed.data() + quant_bytes, scale_bytes,
+                                  (char *) storage->data + all_quant_bytes + first_block * sizeof(uint16_t),
+                                  scale_bytes, ACL_MEMCPY_DEVICE_TO_HOST));
+            ggml_tensor slice = *tensor;
+            slice.ne[0] = block_count * ggml_blck_size(tensor->type);
+            slice.ne[1] = slice.ne[2] = slice.ne[3] = 1;
+            ggml_backend_cann_transform_back(&slice, transformed.data(), restored.data());
+            memcpy(data, restored.data() + start - first_block * block_size, size);
+            return;
+        }
         void * transform_buffer = malloc(size);
         ACL_CHECK(aclrtMemcpy(transform_buffer, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
         ggml_backend_cann_transform_back(tensor, transform_buffer, data);
