@@ -1621,6 +1621,7 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+    bool temporal_groups;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1740,7 +1741,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     }
 
                     // M-RoPE causal mask
-                    if (is_2d) {
+                    if (is_2d && !args.temporal_groups) {
                         if (p0 == p1) {
                             const auto & p0_ext = cells.ext_get(j);
 
@@ -1844,6 +1845,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        // SenseNova image patches share one temporal position and attend to the full image.
+        /*.temporal_groups  =*/ model.arch == LLM_ARCH_SENSENOVA_U1,
     };
 
     if (dst->type == GGML_TYPE_F16) {
