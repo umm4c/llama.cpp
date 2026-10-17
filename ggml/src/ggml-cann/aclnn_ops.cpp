@@ -1527,7 +1527,33 @@ void ggml_cann_im2col(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     // Calculate im2col.
     // If dst is f16, tmp_buffer is f32, we need alloc src.typesize *
     // dst.elemcount.
-    ggml_cann_pool_alloc im2col_allocator(ctx.pool(), ggml_nelements(dst) * ggml_element_size(src1) * n_bytes_factor);
+    ggml_cann_pool_alloc aligned_input_allocator(ctx.pool());
+    int64_t im2col_width = OW;
+#ifdef ASCEND_310P
+    // Align the Im2col output rows on 310P, then crop the extra columns.
+    if (is_2D && src1->type == GGML_TYPE_F32 && OW % 8 != 0) {
+        im2col_width = GGML_PAD(OW, 8);
+        const int64_t aligned_width = (im2col_width - 1) * s0 - 2 * p0 + d0 * (KW - 1) + 1;
+        int64_t aligned_ne[] = { aligned_width, ne11, IC, N };
+        size_t aligned_nb[GGML_MAX_DIMS];
+        aligned_nb[0] = sizeof(float);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            aligned_nb[i] = aligned_nb[i - 1] * aligned_ne[i - 1];
+        }
+        aligned_input_allocator.alloc(aligned_width * ne11 * IC * N * sizeof(float));
+        auto aligned_input = ggml_cann_create_tensor(aligned_input_allocator.get(), ACL_FLOAT, sizeof(float),
+                                                     aligned_ne, aligned_nb, GGML_MAX_DIMS);
+        int64_t paddings[] = { 0, aligned_width - IW, 0, 0, 0, 0, 0, 0 };
+        aclnn_pad(ctx, acl_src1.get(), aligned_input.get(), paddings);
+        acl_src1 = std::move(aligned_input);
+        tmp_im2col_ne[0] = im2col_width * OH;
+        for (int i = 1; i < GGML_MAX_DIMS - 1; ++i) {
+            tmp_im2col_nb[i] = tmp_im2col_nb[i - 1] * tmp_im2col_ne[i - 1];
+        }
+    }
+#endif
+    const int64_t im2col_elements = im2col_width * OH * IC * KH * KW * N * n_bytes_factor;
+    ggml_cann_pool_alloc im2col_allocator(ctx.pool(), im2col_elements * ggml_element_size(src1));
     void *               tmp_im2col_buffer = im2col_allocator.get();
 
     acl_tensor_ptr tmp_im2col_tensor =
@@ -1550,7 +1576,7 @@ void ggml_cann_im2col(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_cann_pool_alloc tmp_cast_allocator(ctx.pool());
     void *               tmp_cast_buffer = nullptr;
     if (src1->type != dst->type) {
-        tmp_cast_allocator.alloc(ggml_nbytes(dst) * n_bytes_factor);
+        tmp_cast_allocator.alloc(im2col_elements * ggml_element_size(dst));
         tmp_cast_buffer = tmp_cast_allocator.get();
         size_t temp_cast_nb[GGML_MAX_DIMS - 1];
         temp_cast_nb[0] = ggml_type_size(dst->type);
@@ -1566,7 +1592,21 @@ void ggml_cann_im2col(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 
     // post-processing
     if (is_2D) {
-        ggml_cann_im2col_2d_post_process(ctx, dst, src1, tmp_cast_tensor.get(), tmp_im2col_tensor.get());
+        if (im2col_width != OW) {
+            int64_t cropped_ne[] = { OW, OH, IC * KH * KW, N };
+            size_t cropped_nb[] = { ggml_element_size(dst),
+                                    size_t(im2col_width) * ggml_element_size(dst),
+                                    size_t(im2col_width * OH) * ggml_element_size(dst),
+                                    size_t(im2col_width * OH * IC * KH * KW) * ggml_element_size(dst) };
+            auto cropped = ggml_cann_create_tensor(tmp_cast_buffer ? tmp_cast_buffer : tmp_im2col_buffer,
+                                                   ggml_cann_type_mapping(dst->type), ggml_element_size(dst),
+                                                   cropped_ne, cropped_nb, GGML_MAX_DIMS);
+            auto acl_dst = ggml_cann_create_tensor(dst);
+            int64_t permute_dim[] = { 0, 2, 3, 1 };
+            aclnn_permute(ctx, cropped.get(), acl_dst.get(), permute_dim, GGML_MAX_DIMS);
+        } else {
+            ggml_cann_im2col_2d_post_process(ctx, dst, src1, tmp_cast_tensor.get(), tmp_im2col_tensor.get());
+        }
     } else {
         std::vector<int64_t> im2col_op_params = { KH, KW, IW, IC, N, OH, OW, s0, p0, d0, n_bytes_factor };
         ggml_cann_im2col_1d_post_process(ctx, dst, src1, tmp_cast_tensor.get(), tmp_im2col_tensor.get(),
