@@ -270,6 +270,10 @@ llama_context::llama_context(
     }
 
     cparams.op_offload = params.op_offload;
+    if (params.kv_v_contiguous && model.arch != LLM_ARCH_SENSENOVA_U1) {
+        throw std::runtime_error("Contiguous V cache is only supported for SenseNova U1");
+    }
+    cparams.kv_v_contiguous = params.kv_v_contiguous;
     cparams.kv_unified = params.kv_unified;
 
     // initialized later
@@ -3648,6 +3652,7 @@ llama_context_params llama_context_default_params() {
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
+        /*.kv_v_contiguous             =*/ false,
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
