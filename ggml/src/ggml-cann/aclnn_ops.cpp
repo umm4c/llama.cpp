@@ -1986,6 +1986,13 @@ void ggml_cann_softmax(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
     memcpy(&max_bias, (float *) dst->op_params + 1, sizeof(float));
 
+#ifdef ASCEND_310P
+    if (scale == 1.0f && src1 == nullptr && ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
+        aclnn_softmax(ctx, acl_src0.get(), 3, acl_dst.get());
+        return;
+    }
+#endif
+
     // input mul scale
     acl_scalar_ptr       acl_scale = ggml_cann_create_scalar(&scale, aclDataType::ACL_FLOAT);
     ggml_cann_pool_alloc src_tensor_allocator(ctx.pool(), ggml_nbytes(src0));
