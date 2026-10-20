@@ -75,6 +75,10 @@
 
 #define ACL_CHECK(stmt) ACL_CHECK_GEN(stmt, 0, aclGetRecentErrMsg)
 
+aclError ggml_cann_memcpy(void * dst, size_t capacity, const void * src, size_t size, aclrtMemcpyKind kind);
+aclError ggml_cann_memcpy_async(void * dst, size_t capacity, const void * src, size_t size, aclrtMemcpyKind kind, aclrtStream stream);
+
+
 /**
  * @brief Contains information about CANN devices.
  */
