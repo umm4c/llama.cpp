@@ -74,6 +74,56 @@
 // Thread-local variable to record the current device of this thread.
 thread_local int g_current_cann_device = -1;
 
+namespace {
+struct transfer_counters {
+    std::atomic<uint64_t> bytes[3]{};
+    std::atomic<uint64_t> calls[3]{};
+};
+transfer_counters cann_transfers[GGML_CANN_MAX_DEVICES];
+
+bool transfer_metrics_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CANN_TRANSFER_METRICS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+void record_transfer(size_t size, aclrtMemcpyKind kind) {
+    if (!transfer_metrics_enabled() || !size) return;
+    int direction = kind == ACL_MEMCPY_HOST_TO_DEVICE ? 0 :
+                    kind == ACL_MEMCPY_DEVICE_TO_HOST ? 1 :
+                    kind == ACL_MEMCPY_DEVICE_TO_DEVICE ? 2 : -1;
+    int device = g_current_cann_device;
+    if (direction < 0 || device < 0 || device >= GGML_CANN_MAX_DEVICES) return;
+    cann_transfers[device].bytes[direction].fetch_add(size, std::memory_order_relaxed);
+    cann_transfers[device].calls[direction].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool get_transfer_stats_v1(int device, uint64_t * bytes, uint64_t * calls) {
+    if (!transfer_metrics_enabled() || device < 0 || device >= GGML_CANN_MAX_DEVICES || !bytes || !calls) return false;
+    for (int i = 0; i < 3; ++i) {
+        bytes[i] = cann_transfers[device].bytes[i].load(std::memory_order_relaxed);
+        calls[i] = cann_transfers[device].calls[i].load(std::memory_order_relaxed);
+    }
+    return true;
+}
+}
+
+aclError ggml_cann_memcpy(void * dst, size_t capacity, const void * src, size_t size, aclrtMemcpyKind kind) {
+    const auto status = aclrtMemcpy(dst, capacity, src, size, kind);
+    if (status == ACL_SUCCESS) record_transfer(size, kind);
+    return status;
+}
+
+aclError ggml_cann_memcpy_async(void * dst, size_t capacity, const void * src, size_t size,
+                              aclrtMemcpyKind kind, aclrtStream stream) {
+    const auto status = aclrtMemcpyAsync(dst, capacity, src, size, kind, stream);
+    if (status == ACL_SUCCESS) record_transfer(size, kind);
+    return status;
+}
+
+
 /**
  * @brief Set the CANN device to be used.
  *
@@ -1292,7 +1342,7 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     // Plain tensor (not quantized, not NZ): direct copy, no tracking needed
     if (!is_quantized && !is_nz) {
-        ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+        ACL_CHECK(ggml_cann_memcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
         return;
     }
 
@@ -1301,13 +1351,13 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         if (is_quantized) {
             void * transform_buffer = malloc(size);
             ggml_backend_cann_transform(tensor, data, transform_buffer);
-            ACL_CHECK(aclrtMemcpy(tensor->data, size, transform_buffer, size, ACL_MEMCPY_HOST_TO_DEVICE));
+            ACL_CHECK(ggml_cann_memcpy(tensor->data, size, transform_buffer, size, ACL_MEMCPY_HOST_TO_DEVICE));
             free(transform_buffer);
         } else {
             // NZ weight
             GGML_ASSERT(tensor->ne[2] == 1);
             GGML_ASSERT(tensor->ne[3] == 1);
-            ACL_CHECK(aclrtMemcpy(tensor->data, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+            ACL_CHECK(ggml_cann_memcpy(tensor->data, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
             weight_format_to_nz(tensor, ctx->device);
         }
         return;
@@ -1325,7 +1375,7 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         memcpy(tracker->host_buffer.data() + offset, data, size);
     } else {
         // NZ weight: upload chunk to device immediately, defer conversion
-        ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+        ACL_CHECK(ggml_cann_memcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
     }
 
     tracker->bytes_written += size;
@@ -1335,7 +1385,7 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         if (is_quantized) {
             void * transform_buffer = malloc(tracker->total_bytes);
             ggml_backend_cann_transform(tensor, tracker->host_buffer.data(), transform_buffer);
-            ACL_CHECK(aclrtMemcpy(tensor->data, tracker->total_bytes, transform_buffer, tracker->total_bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+            ACL_CHECK(ggml_cann_memcpy(tensor->data, tracker->total_bytes, transform_buffer, tracker->total_bytes, ACL_MEMCPY_HOST_TO_DEVICE));
             free(transform_buffer);
         }
 
@@ -1374,7 +1424,7 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_cann_set_device(ctx->device);
 
     if (!need_transform(tensor->type)) {
-        ACL_CHECK(aclrtMemcpy(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
+        ACL_CHECK(ggml_cann_memcpy(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
     } else {
         if (tensor->view_src || offset != 0 || size != ggml_nbytes(tensor)) {
             // Q4_0 and Q8_0 keep all quantized values before all scales on the device.
@@ -1394,10 +1444,10 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
             const size_t all_quant_bytes = ggml_nelements(storage) / ggml_blck_size(tensor->type) * quant_size;
             std::vector<uint8_t> transformed(quant_bytes + scale_bytes);
             std::vector<uint8_t> restored(block_count * block_size);
-            ACL_CHECK(aclrtMemcpy(transformed.data(), quant_bytes,
+            ACL_CHECK(ggml_cann_memcpy(transformed.data(), quant_bytes,
                                   (char *) storage->data + first_block * quant_size,
                                   quant_bytes, ACL_MEMCPY_DEVICE_TO_HOST));
-            ACL_CHECK(aclrtMemcpy(transformed.data() + quant_bytes, scale_bytes,
+            ACL_CHECK(ggml_cann_memcpy(transformed.data() + quant_bytes, scale_bytes,
                                   (char *) storage->data + all_quant_bytes + first_block * sizeof(uint16_t),
                                   scale_bytes, ACL_MEMCPY_DEVICE_TO_HOST));
             ggml_tensor slice = *tensor;
@@ -1408,7 +1458,7 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
             return;
         }
         void * transform_buffer = malloc(size);
-        ACL_CHECK(aclrtMemcpy(transform_buffer, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
+        ACL_CHECK(ggml_cann_memcpy(transform_buffer, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
         ggml_backend_cann_transform_back(tensor, transform_buffer, data);
         free(transform_buffer);
     }
@@ -1437,7 +1487,7 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         size_t memcpy_size = ggml_nbytes(src);
         // Same device.
         if (src_ctx->device == dst_ctx->device) {
-            ACL_CHECK(aclrtMemcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
+            ACL_CHECK(ggml_cann_memcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
                                   ACL_MEMCPY_DEVICE_TO_DEVICE));
             return true;
         } else {
@@ -1451,7 +1501,7 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
             if (canAccessPeer) {
                 ggml_cann_set_device(src_ctx->device);
                 ACL_CHECK(aclrtDeviceEnablePeerAccess(dst_ctx->device, 0));
-                ACL_CHECK(aclrtMemcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
+                ACL_CHECK(ggml_cann_memcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
                                       ACL_MEMCPY_DEVICE_TO_DEVICE));
                 return true;
             }
@@ -2119,7 +2169,7 @@ static void ggml_backend_cann_set_tensor_async(ggml_backend_t backend,
     GGML_ASSERT(buf->buft == ggml_backend_cann_buffer_type(cann_ctx->device) && "unsupported buffer type");
     GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
-    ACL_CHECK(aclrtMemcpyAsync((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE,
+    ACL_CHECK(ggml_cann_memcpy_async((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE,
                                cann_ctx->stream()));
 }
 
@@ -2145,7 +2195,7 @@ static void ggml_backend_cann_get_tensor_async(ggml_backend_t      backend,
     GGML_ASSERT(buf->buft == ggml_backend_cann_buffer_type(cann_ctx->device) && "unsupported buffer type");
     GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
-    ACL_CHECK(aclrtMemcpyAsync(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST,
+    ACL_CHECK(ggml_cann_memcpy_async(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST,
                                cann_ctx->stream()));
 }
 
@@ -2207,7 +2257,7 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
         ACL_CHECK(aclrtDeviceEnablePeerAccess(cann_ctx_dst->device, 0));
 
         // wait for task_queue empty to keep task order.
-        ACL_CHECK(aclrtMemcpyAsync(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
+        ACL_CHECK(ggml_cann_memcpy_async(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
                                    cann_ctx_src->stream()));
         // record event on src stream after the copy
         // TODO: this event is not effective with acl graph mode, change to use aclrtSynchronizeStream
@@ -2222,7 +2272,7 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
         ACL_CHECK(aclrtSynchronizeStream(cann_ctx_src->stream()));
     } else {
         // src and dst are on the same backend
-        ACL_CHECK(aclrtMemcpyAsync(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
+        ACL_CHECK(ggml_cann_memcpy_async(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
                                    cann_ctx_dst->stream()));
     }
 
@@ -3020,8 +3070,7 @@ static ggml_backend_dev_t ggml_backend_cann_reg_get_device(ggml_backend_reg_t re
 
 static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
-    // reserved for future use
+    if (std::strcmp(name, "ggml_backend_cann_get_transfer_stats_v1") == 0) return (void *) get_transfer_stats_v1;
     return nullptr;
 }
 
