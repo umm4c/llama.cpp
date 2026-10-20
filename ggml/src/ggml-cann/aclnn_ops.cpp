@@ -1986,6 +1986,13 @@ void ggml_cann_softmax(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
     memcpy(&max_bias, (float *) dst->op_params + 1, sizeof(float));
 
+#ifdef ASCEND_310P
+    if (scale == 1.0f && src1 == nullptr && ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
+        aclnn_softmax(ctx, acl_src0.get(), 3, acl_dst.get());
+        return;
+    }
+#endif
+
     // input mul scale
     acl_scalar_ptr       acl_scale = ggml_cann_create_scalar(&scale, aclDataType::ACL_FLOAT);
     ggml_cann_pool_alloc src_tensor_allocator(ctx.pool(), ggml_nbytes(src0));
@@ -2972,12 +2979,28 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
         aclnn_repeat(ctx, acl_sin_tensor.get(), acl_sin_repeat_tensor.get(), repeatsArray);
         aclnn_repeat(ctx, acl_cos_tensor.get(), acl_cos_repeat_tensor.get(), repeatsArray);
     } else {
+#ifdef ASCEND_310P
+        // Duplicate each scalar by tiling singleton columns.
+        int64_t repeat_src_ne[] = { 1, theta_length, 1, 1 };
+        int64_t repeat_dst_ne[] = { 2, theta_length, 1, 1 };
+        size_t repeat_src_nb[] = { sizeof(float), sizeof(float), theta_length * sizeof(float), theta_length * sizeof(float) };
+        size_t repeat_dst_nb[] = { sizeof(float), 2 * sizeof(float), 2 * theta_length * sizeof(float), 2 * theta_length * sizeof(float) };
+        int64_t repeats[] = { 1, 1, 1, 2 };
+        auto repeat_interleaved = [&](void * src, void * dst) {
+            auto input = ggml_cann_create_tensor(src, ACL_FLOAT, sizeof(float), repeat_src_ne, repeat_src_nb, GGML_MAX_DIMS);
+            auto output = ggml_cann_create_tensor(dst, ACL_FLOAT, sizeof(float), repeat_dst_ne, repeat_dst_nb, GGML_MAX_DIMS);
+            aclnn_repeat(ctx, input.get(), output.get(), repeats);
+        };
+        repeat_interleaved(sin_buffer, ctx.current_rope_cache().sin_cache);
+        repeat_interleaved(cos_buffer, ctx.current_rope_cache().cos_cache);
+#else
         int64_t num_repeats = 2;
         int64_t dim         = 3;
         int64_t output_size = theta_scale_length * num_repeats;
         // [sinθ1, sinθ2, ..., sinθn, sinθ1, sinθ2, ..., sinθn]
         aclnn_repeat_interleave(ctx, acl_sin_tensor.get(), acl_sin_repeat_tensor.get(), dim, num_repeats, output_size);
         aclnn_repeat_interleave(ctx, acl_cos_tensor.get(), acl_cos_repeat_tensor.get(), dim, num_repeats, output_size);
+#endif
     }
 
     // Update cached value.
