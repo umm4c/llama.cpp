@@ -30,6 +30,7 @@
 
 #include <acl/acl.h>
 #include <aclnnop/aclnn_trans_matmul_weight.h>
+#include <aclnnop/aclnn_permute.h>
 #include <stdarg.h>
 
 #include <chrono>
@@ -839,6 +840,11 @@ struct TensorSetTracker {
     std::vector<uint8_t> host_buffer; ///< Host staging buffer for quantized tensors
 };
 
+struct cann_q8_nz_shape {
+    int64_t k;
+    int64_t n;
+};
+
 /**
  * @brief Context for managing a CANN buffer associated with a specific device.
  *
@@ -851,6 +857,8 @@ struct ggml_backend_cann_buffer_context {
 
     std::mutex tracker_mutex;   ///< Protects the trackers map
     std::unordered_map<void *, std::unique_ptr<TensorSetTracker>> trackers;
+    std::unordered_map<void *, cann_q8_nz_shape> q8_nz;
+    std::recursive_mutex q8_write_mutex;
 
     /**
      * @brief Constructor to initialize the CANN buffer context.
@@ -929,6 +937,91 @@ static const char * ggml_backend_cann_buffer_type_name(ggml_backend_buffer_type_
  */
 static bool ggml_backend_buft_is_cann(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cann_buffer_type_name;
+}
+
+static const ggml_tensor * cann_q8_storage(const ggml_tensor * tensor, size_t & offset) {
+    offset = 0;
+    while (tensor->view_src) {
+        offset += tensor->view_offs;
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
+static std::optional<cann_q8_nz_shape> cann_find_q8_nz(const ggml_tensor * tensor) {
+    if (tensor->type != GGML_TYPE_Q8_0) {
+        return std::nullopt;
+    }
+    size_t offset;
+    const auto * storage = cann_q8_storage(tensor, offset);
+    if (!storage->buffer || !ggml_backend_buft_is_cann(storage->buffer->buft)) {
+        return std::nullopt;
+    }
+    auto * ctx = (ggml_backend_cann_buffer_context *) storage->buffer->context;
+    std::lock_guard<std::mutex> lock(ctx->tracker_mutex);
+    auto it = ctx->q8_nz.find(storage->data);
+    return it == ctx->q8_nz.end() ? std::nullopt : std::optional<cann_q8_nz_shape>(it->second);
+}
+
+bool ggml_cann_q8_is_nz(const ggml_tensor * tensor) {
+    return cann_find_q8_nz(tensor).has_value();
+}
+
+static bool cann_q8_nz_eligible(const ggml_tensor * tensor) {
+#ifdef ASCEND_310P
+    static const bool enabled = parse_bool(get_env_as_lowercase("GGML_CANN_Q8_NZ").value_or("off"));
+    return enabled && tensor->type == GGML_TYPE_Q8_0 && !tensor->view_src &&
+           ggml_is_contiguous(tensor) && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+           tensor->ne[0] > 0 && tensor->ne[1] > 0 && tensor->ne[0] % 512 == 0 &&
+           tensor->ne[1] % 32 == 0 && tensor->ne[1] < 65535 &&
+           is_matmul_weight(tensor);
+#else
+    GGML_UNUSED(tensor);
+    return false;
+#endif
+}
+
+// Restore ND only for consumers that cannot use the packed matrix directly.
+static void cann_q8_nz_to_nd(ggml_backend_cann_context & ctx, const ggml_tensor * tensor,
+                            ggml_cann_pool_alloc & allocation) {
+    const auto shape = cann_find_q8_nz(tensor).value();
+    size_t offset;
+    const auto * storage = cann_q8_storage(tensor, offset);
+    const size_t quant_bytes = size_t(shape.k) * shape.n;
+    const size_t scale_bytes = quant_bytes / QK8_0 * sizeof(uint16_t);
+    const size_t total_bytes = quant_bytes + scale_bytes;
+    const bool whole = offset == 0 && ggml_nelements(tensor) == shape.k * shape.n;
+    ggml_cann_pool_alloc full(ctx.pool());
+    void * result = allocation.alloc(ctx.pool(), whole ? total_bytes : ggml_nbytes(tensor));
+    void * output = whole ? result : full.alloc(total_bytes);
+
+    int64_t ne[] = { shape.k / 32, shape.n / 16, 16, 32 };
+    int64_t strides[] = { shape.n * 32, 512, 32, 1 };
+    int64_t out_ne[] = { shape.n / 16, 16, shape.k / 32, 32 };
+    int64_t out_strides[] = { shape.k * 16, shape.k, 32, 1 };
+    int64_t order[] = { 1, 2, 0, 3 };
+    auto src = acl_tensor_ptr(aclCreateTensor(ne, 4, ACL_INT8, strides, 0, ACL_FORMAT_ND,
+                                             ne, 4, storage->data));
+    auto dst = acl_tensor_ptr(aclCreateTensor(out_ne, 4, ACL_INT8, out_strides, 0, ACL_FORMAT_ND,
+                                             out_ne, 4, output));
+    auto dims = ggml_cann_create_int_array(order, 4);
+    GGML_CANN_CALL_ACLNN_OP(ctx, Permute, src.get(), dims.get(), dst.get());
+    ACL_CHECK(ggml_cann_memcpy_async((char *) output + quant_bytes, scale_bytes,
+                                    (char *) storage->data + quant_bytes, scale_bytes,
+                                    ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+    if (!whole) {
+        GGML_ASSERT(ggml_is_contiguous(tensor) && offset % sizeof(block_q8_0) == 0);
+        const size_t first = offset / sizeof(block_q8_0);
+        const size_t count = ggml_nelements(tensor) / QK8_0;
+        GGML_ASSERT((first + count) * QK8_0 <= quant_bytes);
+        auto * slice = (char *) result;
+        ACL_CHECK(ggml_cann_memcpy_async(slice, count * QK8_0,
+                                        (char *) output + first * QK8_0, count * QK8_0,
+                                        ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+        ACL_CHECK(ggml_cann_memcpy_async(slice + count * QK8_0, count * sizeof(uint16_t),
+                                        (char *) output + quant_bytes + first * sizeof(uint16_t),
+                                        count * sizeof(uint16_t), ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+    }
 }
 
 /**
@@ -1303,7 +1396,41 @@ static void weight_format_to_nz(ggml_tensor * tensor, int device) {
     void * g_nz_workspace = g_nz_workspaces[device].get();
 
     ACL_CHECK(aclnnTransMatmulWeight(g_nz_workspace, workspaceSize, executor, nullptr));
+    // The workspace is shared by concurrent tensor uploads.
+    ACL_CHECK(aclrtSynchronizeStream(nullptr));
 }
+
+static void cann_q8_weight_to_nz(ggml_backend_cann_buffer_context * ctx, ggml_tensor * tensor) {
+    if (!cann_q8_nz_eligible(tensor)) {
+        std::lock_guard<std::mutex> lock(ctx->tracker_mutex);
+        ctx->q8_nz.erase(tensor->data);
+        return;
+    }
+    int64_t ne[] = { tensor->ne[1], tensor->ne[0] };
+    int64_t strides[] = { tensor->ne[0], 1 };
+    auto dims = ggml_cann_create_int_array(ne, 2);
+    size_t packed_size;
+    ACL_CHECK(aclnnCalculateMatmulWeightSizeV2(dims.get(), ACL_INT8, &packed_size));
+    // The scale payload stays at the same offset.
+    GGML_ASSERT(packed_size == size_t(ggml_nelements(tensor)));
+    auto weight = acl_tensor_ptr(aclCreateTensor(ne, 2, ACL_INT8, strides, 0, ACL_FORMAT_ND,
+                                                ne, 2, tensor->data));
+    uint64_t bytes = 0;
+    aclOpExecutor * executor;
+    ACL_CHECK(aclnnTransMatmulWeightGetWorkspaceSize(weight.get(), &bytes, &executor));
+    {
+        std::lock_guard<std::mutex> lock(g_nz_workspaces[ctx->device].mtx);
+        auto & workspace = g_nz_workspaces[ctx->device];
+        workspace.realloc(bytes);
+        ACL_CHECK(aclnnTransMatmulWeight(workspace.get(), bytes, executor, nullptr));
+        ACL_CHECK(aclrtSynchronizeStream(nullptr));
+    }
+    std::lock_guard<std::mutex> lock(ctx->tracker_mutex);
+    ctx->q8_nz[tensor->data] = { tensor->ne[0], tensor->ne[1] };
+}
+
+static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
+                                               void * data, size_t offset, size_t size);
 
 // TODO: need handle tensor which has paddings.
 /**
@@ -1336,6 +1463,11 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
 
+    std::unique_lock<std::recursive_mutex> q8_write_lock(ctx->q8_write_mutex, std::defer_lock);
+    if (ggml_cann_q8_is_nz(tensor)) {
+        q8_write_lock.lock();
+    }
+
     bool is_quantized = need_transform(tensor->type);
     bool is_nz        = !is_quantized && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
                  is_matmul_weight((const ggml_tensor *) tensor);
@@ -1346,6 +1478,17 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         return;
     }
 
+    if ((tensor->view_src || offset != 0 || size != ggml_nbytes(tensor)) && ggml_cann_q8_is_nz(tensor)) {
+        size_t view_offset;
+        const auto * storage = cann_q8_storage(tensor, view_offset);
+        std::vector<uint8_t> original(ggml_nbytes(storage));
+        ggml_backend_cann_buffer_get_tensor(buffer, storage, original.data(), 0, original.size());
+        GGML_ASSERT(view_offset + offset + size <= original.size());
+        memcpy(original.data() + view_offset + offset, data, size);
+        ggml_backend_cann_buffer_set_tensor(buffer, const_cast<ggml_tensor *>(storage), original.data(), 0, original.size());
+        return;
+    }
+
     // Single-shot write (full tensor at once): handle directly without tracking overhead
     if (offset == 0 && size == ggml_nbytes(tensor)) {
         if (is_quantized) {
@@ -1353,6 +1496,7 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
             ggml_backend_cann_transform(tensor, data, transform_buffer);
             ACL_CHECK(ggml_cann_memcpy(tensor->data, size, transform_buffer, size, ACL_MEMCPY_HOST_TO_DEVICE));
             free(transform_buffer);
+            cann_q8_weight_to_nz(ctx, tensor);
         } else {
             // NZ weight
             GGML_ASSERT(tensor->ne[2] == 1);
@@ -1387,6 +1531,7 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
             ggml_backend_cann_transform(tensor, tracker->host_buffer.data(), transform_buffer);
             ACL_CHECK(ggml_cann_memcpy(tensor->data, tracker->total_bytes, transform_buffer, tracker->total_bytes, ACL_MEMCPY_HOST_TO_DEVICE));
             free(transform_buffer);
+            cann_q8_weight_to_nz(ctx, tensor);
         }
 
         if (is_nz) {
@@ -1422,6 +1567,25 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+
+    if (auto shape = cann_find_q8_nz(tensor)) {
+        size_t view_offset;
+        const auto * storage = cann_q8_storage(tensor, view_offset);
+        const size_t count = size_t(shape->k) * shape->n;
+        std::vector<uint8_t> packed(ggml_nbytes(storage)), nd(packed.size()), original(packed.size());
+        ACL_CHECK(ggml_cann_memcpy(packed.data(), packed.size(), storage->data, packed.size(), ACL_MEMCPY_DEVICE_TO_HOST));
+        for (int64_t n = 0; n < shape->n; ++n) {
+            for (int64_t k = 0; k < shape->k; k += 32) {
+                const size_t block = ((k / 32 * (shape->n / 16) + n / 16) * 16 + n % 16) * 32;
+                memcpy(nd.data() + n * shape->k + k, packed.data() + block, 32);
+            }
+        }
+        memcpy(nd.data() + count, packed.data() + count, packed.size() - count);
+        ggml_backend_cann_transform_back(storage, nd.data(), original.data());
+        GGML_ASSERT(view_offset + offset + size <= original.size());
+        memcpy(data, original.data() + view_offset + offset, size);
+        return;
+    }
 
     if (!need_transform(tensor->type)) {
         ACL_CHECK(ggml_cann_memcpy(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
@@ -1480,6 +1644,9 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
 static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                                 const ggml_tensor *   src,
                                                 ggml_tensor *         dst) {
+    if (ggml_cann_q8_is_nz(src) || ggml_cann_q8_is_nz(dst) || cann_q8_nz_eligible(dst)) {
+        return false;
+    }
     if (ggml_backend_buft_is_cann(src->buffer->buft)) {
         ggml_backend_cann_buffer_context * src_ctx = (ggml_backend_cann_buffer_context *) src->buffer->context;
         ggml_backend_cann_buffer_context * dst_ctx = (ggml_backend_cann_buffer_context *) buffer->context;
@@ -1523,6 +1690,11 @@ static void ggml_backend_cann_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    if (ggml_cann_q8_is_nz(tensor)) {
+        std::vector<uint8_t> bytes(size, value);
+        ggml_backend_cann_buffer_set_tensor(buffer, tensor, bytes.data(), offset, size);
+        return;
+    }
     ACL_CHECK(aclrtMemset((char *) tensor->data + offset, size, value, size));
 }
 
@@ -1853,6 +2025,31 @@ ggml_backend_buffer_type_t ggml_backend_cann_host_buffer_type() {
  * @return true if the computation was successful; false otherwise.
  */
 static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct ggml_tensor * dst) {
+    ggml_tensor op = *dst;
+    ggml_tensor sources[GGML_MAX_SRC];
+    ggml_cann_pool_alloc nd[GGML_MAX_SRC];
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        auto * src = dst->src[i];
+        if (!src || !ggml_cann_q8_is_nz(src)) {
+            continue;
+        }
+        auto shape = cann_find_q8_nz(src).value();
+        size_t offset;
+        cann_q8_storage(src, offset);
+        const bool direct = dst->op == GGML_OP_MUL_MAT && i == 0 &&
+                            ggml_is_contiguous(src) && offset == 0 &&
+                            src->ne[0] == shape.k && src->ne[1] == shape.n &&
+                            src->ne[2] == 1 && src->ne[3] == 1 && dst->src[1]->ne[1] != 2;
+        if (!direct) {
+            cann_q8_nz_to_nd(ctx, src, nd[i]);
+            sources[i] = *src;
+            sources[i].data = nd[i].get();
+            sources[i].view_src = nullptr;
+            sources[i].view_offs = 0;
+            op.src[i] = &sources[i];
+        }
+    }
+    dst = &op;
     switch (dst->op) {
         case GGML_OP_REPEAT:
             ggml_cann_repeat(ctx, dst);
@@ -2217,6 +2414,10 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
                                                const ggml_tensor * src,
                                                ggml_tensor *       dst) {
     GGML_ASSERT(ggml_backend_is_cann(backend_src) || ggml_backend_is_cann(backend_dst));
+
+    if (ggml_cann_q8_is_nz(src) || ggml_cann_q8_is_nz(dst) || cann_q8_nz_eligible(dst)) {
+        return false;
+    }
 
     GGML_ASSERT(!is_matmul_weight((const ggml_tensor *) src));
 

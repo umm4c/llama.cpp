@@ -2452,6 +2452,16 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
             acl_tensor_ptr acl_scale_tensor =
                 ggml_cann_create_tensor(scale_offset + batch0 * scale_stride, ACL_FLOAT16, scale_elem_size, scale_ne,
                                         scale_nb, 2, ACL_FORMAT_ND, scale_ne_offset);
+            if (ggml_cann_q8_is_nz(src0)) {
+                int64_t ne[] = { src0->ne[1], src0->ne[0] };
+                int64_t strides[] = { src0->ne[0], 1 };
+                acl_weight_tensor.reset(aclCreateTensor(ne, 2, ACL_INT8, strides, 0, ACL_FORMAT_FRACTAL_NZ,
+                                                        ne, 2, src0->data));
+                int64_t scale_ne_nz[] = { src0->ne[0] / QK8_0, src0->ne[1] };
+                size_t scale_nb_nz[] = { sizeof(uint16_t), size_t(src0->ne[0] / QK8_0) * sizeof(uint16_t) };
+                acl_scale_tensor = ggml_cann_create_tensor(scale_offset, ACL_FLOAT16, sizeof(uint16_t),
+                                                          scale_ne_nz, scale_nb_nz, 2);
+            }
             acl_tensor_ptr acl_output_tensor =
                 ggml_cann_create_tensor((char *) output_buffer + batch1 * output_stride, ACL_FLOAT16, output_elem_size,
                                         output_ne, output_nb, 2, ACL_FORMAT_ND, output_ne_offset);

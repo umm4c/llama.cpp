@@ -105,6 +105,7 @@ struct ggml_cann_device_info {
 const ggml_cann_device_info & ggml_cann_info();
 
 void    ggml_cann_set_device(int32_t device);
+bool    ggml_cann_q8_is_nz(const ggml_tensor * tensor);
 
 std::optional<std::string> get_env_as_lowercase(const std::string & name);
 bool                       parse_bool(const std::string & value);
