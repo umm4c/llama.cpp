@@ -335,6 +335,14 @@ Controls automatic cleanup of the memory pool. This option is only effective whe
 
 Converting the matmul weight format from ND to NZ to improve performance. Enabled by default.
 
+### GGML_CANN_Q8_NZ
+
+Experimental 310P Q8_0 weight prepacking. Set `GGML_CANN_Q8_NZ=1` before loading the model; default is off. This is independent of `GGML_CANN_WEIGHT_NZ`.
+
+Eligible named linear weights use one resident NZ payload with the original group32 FP16 scales. Activations and output precision follow the existing W8A16 path. The initial implementation requires a contiguous 2D matrix, K divisible by 512, and N divisible by 32 and below 65535. Embeddings and large output heads keep ND storage.
+
+Tensor reads restore GGUF byte order. Copies and partial updates use the logical tensor interface. M=2 and other consumers restore a temporary ND matrix on the NPU to retain the existing computation path. Validate the target model before enabling this option in a deployment profile.
+
 ### GGML_CANN_ACL_GRAPH
 
 Operators are executed using ACL graph execution, rather than in op-by-op (eager) mode. Enabled by default. This option is only effective if `USE_ACL_GRAPH` was enabled at compilation time. To enable it, recompile using:
