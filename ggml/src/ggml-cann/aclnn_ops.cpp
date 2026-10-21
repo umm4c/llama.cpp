@@ -2108,6 +2108,65 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                     dequant_nb[i] = dequant_nb[i - 1] * dequant_ne[i - 1];
                 }
                 const int64_t scale_offset = ggml_nelements(src0) * sizeof(int8_t);
+#ifdef ASCEND_310P
+                // Gather the quantized rows first to avoid expanding the entire vocabulary.
+                // Keep Mul's mixed INT8/FP16 inputs to preserve the existing FP16 rounding.
+                const char * gather_first = std::getenv("GGML_CANN_GET_ROWS_GATHER_FIRST");
+                if ((!gather_first || gather_first[0] != '0' || gather_first[1] != '\0') &&
+                    src0->view_src == nullptr && ggml_is_contiguous(src0) &&
+                    src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                    src1->type == GGML_TYPE_I32 && ggml_is_contiguous(src1) &&
+                    src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                    n_idx > 0 && n_idx <= src0->ne[1] &&
+                    dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst)) {
+                    int64_t row_ne[2] = { src0->ne[0], src0->ne[1] };
+                    size_t row_nb[2] = { sizeof(int8_t), size_t(src0->ne[0]) * sizeof(int8_t) };
+                    int64_t scales_ne[2] = { src0->ne[0] / QK8_0, src0->ne[1] };
+                    size_t scales_nb[2] = { sizeof(uint16_t), size_t(scales_ne[0]) * sizeof(uint16_t) };
+                    int64_t selected_ne[2] = { src0->ne[0], n_idx };
+                    int64_t selected_scales_ne[2] = { scales_ne[0], n_idx };
+                    int64_t idx_ne[1] = { n_idx };
+                    size_t idx_nb[1] = { sizeof(int32_t) };
+
+                    ggml_cann_pool_alloc selected_weight(ctx.pool(), size_t(n_idx) * row_nb[1]);
+                    ggml_cann_pool_alloc selected_scale(ctx.pool(), size_t(n_idx) * scales_nb[1]);
+                    acl_tensor_ptr acl_idx = ggml_cann_create_tensor(
+                        src1->data, ACL_INT32, sizeof(int32_t), idx_ne, idx_nb, 1);
+                    acl_tensor_ptr acl_rows = ggml_cann_create_tensor(
+                        src0->data, ACL_INT8, sizeof(int8_t), row_ne, row_nb, 2);
+                    acl_tensor_ptr acl_scales = ggml_cann_create_tensor(
+                        src0->data, ACL_FLOAT16, sizeof(uint16_t), scales_ne, scales_nb, 2,
+                        ACL_FORMAT_ND, scale_offset);
+                    acl_tensor_ptr acl_selected_rows = ggml_cann_create_tensor(
+                        selected_weight.get(), ACL_INT8, sizeof(int8_t), selected_ne, row_nb, 2);
+                    acl_tensor_ptr acl_selected_scales = ggml_cann_create_tensor(
+                        selected_scale.get(), ACL_FLOAT16, sizeof(uint16_t),
+                        selected_scales_ne, scales_nb, 2);
+                    GGML_CANN_CALL_ACLNN_OP(ctx, GatherV2, acl_rows.get(), 0,
+                                           acl_idx.get(), acl_selected_rows.get());
+                    GGML_CANN_CALL_ACLNN_OP(ctx, GatherV2, acl_scales.get(), 0,
+                                           acl_idx.get(), acl_selected_scales.get());
+
+                    weight_ne[2] = n_idx;
+                    scale_ne[2] = n_idx;
+                    // Dimensions 3 and 4 are singleton; update their contiguous strides.
+                    for (int i = 3; i < GGML_MAX_DIMS + 1; ++i) {
+                        weight_nb[i] = weight_nb[i - 1] * weight_ne[i - 1];
+                        scale_nb[i] = scale_nb[i - 1] * scale_ne[i - 1];
+                        dequant_nb[i] = dequant_nb[i - 1] * weight_ne[i - 1];
+                    }
+                    acl_tensor_ptr acl_weight = ggml_cann_create_tensor(
+                        selected_weight.get(), ACL_INT8, sizeof(int8_t),
+                        weight_ne, weight_nb, GGML_MAX_DIMS + 1);
+                    acl_tensor_ptr acl_scale = ggml_cann_create_tensor(
+                        selected_scale.get(), ACL_FLOAT16, sizeof(uint16_t),
+                        scale_ne, scale_nb, GGML_MAX_DIMS + 1);
+                    acl_tensor_ptr acl_dequant = ggml_cann_create_tensor(
+                        dst->data, ACL_FLOAT, sizeof(float), weight_ne, dequant_nb, GGML_MAX_DIMS + 1);
+                    aclnn_mul(ctx, acl_weight.get(), acl_scale.get(), acl_dequant.get());
+                    break;
+                }
+#endif
                 ggml_cann_pool_alloc dequant_allocator(ctx.pool(),
                                                        ggml_nelements(src0) * ggml_type_size(dst->type));
                 acl_tensor_ptr acl_weight = ggml_cann_create_tensor(src0->data, ACL_INT8, sizeof(int8_t),
