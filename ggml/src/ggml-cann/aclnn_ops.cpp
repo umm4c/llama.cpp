@@ -2117,7 +2117,8 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                     src0->ne[2] == 1 && src0->ne[3] == 1 &&
                     src1->type == GGML_TYPE_I32 && ggml_is_contiguous(src1) &&
                     src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-                    n_idx > 0 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst)) {
+                    n_idx > 0 && n_idx <= src0->ne[1] &&
+                    dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst)) {
                     int64_t row_ne[2] = { src0->ne[0], src0->ne[1] };
                     size_t row_nb[2] = { sizeof(int8_t), size_t(src0->ne[0]) * sizeof(int8_t) };
                     int64_t scales_ne[2] = { src0->ne[0] / QK8_0, src0->ne[1] };

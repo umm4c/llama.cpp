@@ -347,7 +347,7 @@ Tensor reads restore GGUF byte order. Copies and partial updates use the logical
 
 On 310P, Q8_0 GET_ROWS gathers INT8 rows and their group32 FP16 scales before dequantizing. This reduces temporary memory from the full vocabulary to the selected rows and preserves the existing mixed INT8/FP16 Mul rounding.
 
-Enabled by default for contiguous 2D weights without views, contiguous I32 vector indices, and contiguous F32 output. Other shapes and types use the existing path. Set `GGML_CANN_GET_ROWS_GATHER_FIRST=0` before starting the process to restore full-table dequantization. This is independent of Q8 NZ prepacking.
+Enabled by default for contiguous 2D weights without views, contiguous I32 vector indices with at most as many selected rows as vocabulary rows, and contiguous F32 output. Other shapes and types use the existing path. Set `GGML_CANN_GET_ROWS_GATHER_FIRST=0` before starting the process to restore full-table dequantization. This is independent of Q8 NZ prepacking.
 
 ### GGML_CANN_ACL_GRAPH
 
