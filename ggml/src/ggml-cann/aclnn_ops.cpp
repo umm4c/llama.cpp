@@ -3158,12 +3158,6 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     int64_t tail_dims = ne00 - rope_dims;
     bool    has_tail  = tail_dims > 0;
 
-    if (std::getenv("GGML_CANN_TRACE_ROPE") != nullptr) {
-        GGML_LOG_INFO("%s: device=%d n_dims=%d shape=[%lld,%lld,%lld,%lld] mode=%d\n",
-                      __func__, ctx.device, n_dims,
-                      (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03, mode);
-    }
-
     ctx.begin_rope_call();
 
     // init ctx.rope_cos/rope_sin cache

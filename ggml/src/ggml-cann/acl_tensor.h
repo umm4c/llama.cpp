@@ -126,11 +126,13 @@ acl_tensor_ptr ggml_cann_create_tensor(void *      data_ptr,
         acl_storage_len += (tmp_ne[i] - 1) * tmp_stride[i];
     }
 
+    const int64_t elem_offset = offset / type_size;
+    acl_storage_len += elem_offset;
     std::reverse(tmp_ne, tmp_ne + dims);
     std::reverse(tmp_stride, tmp_stride + dims);
 
     aclTensor * raw =
-        aclCreateTensor(tmp_ne, dims, dtype, tmp_stride, offset / type_size, format, &acl_storage_len, 1, data_ptr);
+        aclCreateTensor(tmp_ne, dims, dtype, tmp_stride, elem_offset, format, &acl_storage_len, 1, data_ptr);
 
     return acl_tensor_ptr(raw);
 }

@@ -458,8 +458,21 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
     return err;
 }
 
+static bool ggml_is_view_op(enum ggml_op op);
+
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
+    if (const char * required = getenv("GGML_REQUIRED_DEVICE")) {
+        const char * actual = ggml_backend_dev_name(backend->device);
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (!ggml_is_view_op(cgraph->nodes[i]->op) && cgraph->nodes[i]->op != GGML_OP_NONE) {
+                if (strcmp(required, actual) != 0) {
+                    GGML_ABORT("Static execution rejected %s on %s; required %s\n",
+                               ggml_op_desc(cgraph->nodes[i]), actual, required);
+                }
+            }
+        }
+    }
     return backend->iface.graph_compute(backend, cgraph);
 }
 

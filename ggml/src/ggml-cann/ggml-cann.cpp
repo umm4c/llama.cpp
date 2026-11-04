@@ -2685,9 +2685,6 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
  *              otherwise false.
  */
 static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    if (op->op == GGML_OP_ROPE && std::getenv("GGML_CANN_FORCE_CPU_ROPE") != nullptr) {
-        return false;
-    }
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
@@ -3332,6 +3329,12 @@ ggml_backend_t ggml_backend_cann_init(int32_t device) {
         return nullptr;
     }
     ggml_cann_set_device(ctx->device);
+    // 310P saturates FP16 overflow by default; 910B may instead produce Inf.
+    // Opt in explicitly when reproducing the 310P numerical path on a worker.
+    if (parse_bool(get_env_as_lowercase("GGML_CANN_SATURATION").value_or("off"))) {
+        ACL_CHECK(aclrtSetDeviceSatMode(ACL_RT_OVERFLOW_MODE_SATURATION));
+        GGML_LOG_INFO("%s: device %d uses FP16 overflow saturation\n", __func__, device);
+    }
     ggml_backend_t cann_backend =
         new ggml_backend{ /* .guid      = */ ggml_backend_cann_guid(),
                           /* .interface = */ ggml_backend_cann_interface,
