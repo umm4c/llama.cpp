@@ -315,6 +315,17 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Called before graph allocation to assign devices, and afterwards to validate placement.
+    // Return false to reject allocation. The callback must not execute or reset the scheduler.
+    typedef bool (*ggml_backend_sched_placement_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool allocated, void * user_data);
+    struct ggml_backend_sched_split_info {
+        int node_start;
+        int node_end;
+        ggml_backend_t backend;
+    };
+    GGML_API void ggml_backend_sched_set_placement_callback(ggml_backend_sched_t sched, ggml_backend_sched_placement_callback callback, void * user_data);
+    GGML_API bool ggml_backend_sched_get_split_info(ggml_backend_sched_t sched, int index, struct ggml_backend_sched_split_info * info);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
