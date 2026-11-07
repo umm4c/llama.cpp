@@ -2560,5 +2560,12 @@ bool ggml_backend_sched_get_split_info(ggml_backend_sched_t sched, int index, st
     info->node_start = split.i_start;
     info->node_end = split.i_end;
     info->backend = sched->backends[split.backend_id];
+    info->weight_input_bytes = 0;
+    for (int i = 0; i < split.n_inputs; ++i) {
+        const auto input = split.inputs[i];
+        if (ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            info->weight_input_bytes += ggml_nbytes(input);
+        }
+    }
     return true;
 }
