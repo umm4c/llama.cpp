@@ -838,6 +838,8 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    ggml_backend_sched_placement_callback callback_placement;
+    void * callback_placement_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -2016,6 +2018,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
+    if (sched->callback_placement && !sched->callback_placement(sched, graph, false, sched->callback_placement_user_data)) {
+        return false;
+    }
+
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
@@ -2026,6 +2032,11 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     sched->is_alloc = true;
+
+    if (sched->callback_placement && !sched->callback_placement(sched, graph, true, sched->callback_placement_user_data)) {
+        ggml_backend_sched_reset(sched);
+        return false;
+    }
 
     return true;
 }
@@ -2532,4 +2543,22 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+}
+
+void ggml_backend_sched_set_placement_callback(ggml_backend_sched_t sched, ggml_backend_sched_placement_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_placement = callback;
+    sched->callback_placement_user_data = user_data;
+}
+
+bool ggml_backend_sched_get_split_info(ggml_backend_sched_t sched, int index, struct ggml_backend_sched_split_info * info) {
+    GGML_ASSERT(sched);
+    if (!info || index < 0 || index >= sched->n_splits) {
+        return false;
+    }
+    const auto & split = sched->splits[index];
+    info->node_start = split.i_start;
+    info->node_end = split.i_end;
+    info->backend = sched->backends[split.backend_id];
+    return true;
 }
