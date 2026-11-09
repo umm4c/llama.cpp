@@ -29,6 +29,7 @@
 #include "ggml.h"
 
 #include <acl/acl.h>
+#include <algorithm>
 #include <aclnnop/aclnn_trans_matmul_weight.h>
 #include <aclnnop/aclnn_permute.h>
 #include <stdarg.h>
@@ -2542,10 +2543,66 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
  * @param use_cann_graph               Whether to use CANN graph execution.
  * @param cann_graph_capture_required  Whether graph capture is needed due to graph changes.
  */
+#ifdef ASCEND_310P
+class cann_rope_graph_scope {
+    ggml_backend_cann_context & ctx;
+public:
+    cann_rope_graph_scope(ggml_backend_cann_context & ctx, bool enabled) : ctx(ctx) {
+        ctx.rope_graph_caches.clear();
+        ctx.rope_graph_active = enabled;
+    }
+    void invalidate(const ggml_tensor * node) {
+        if (!ctx.rope_graph_active || ctx.rope_graph_caches.empty()) return;
+        auto write = [&](const ggml_tensor * tensor) {
+            if (!tensor || !tensor->data || ggml_is_empty(tensor)) return;
+            const auto start = reinterpret_cast<uintptr_t>(tensor->data);
+            const auto end = start + ggml_nbytes(tensor);
+            auto & caches = ctx.rope_graph_caches;
+            caches.erase(std::remove_if(caches.begin(), caches.end(), [&](ggml_cann_rope_cache * cache) {
+                const auto & key = *cache->reuse_key;
+                const auto position_start = reinterpret_cast<uintptr_t>(key.data);
+                if (start < position_start + key.position_bytes && position_start < end) {
+                    cache->reuse_key.reset();
+                    return true;
+                }
+                return false;
+            }), caches.end());
+        };
+        // Position storage can be reused by later activations once its last read finishes.
+        // Invalidate at the actual writer, rather than banning reuse throughout the graph.
+        write(node);
+        switch (node->op) {
+            case GGML_OP_ROPE:
+                // The 310P F32 implementation also modifies its activation input.
+                write(node->src[0]);
+                break;
+            case GGML_OP_CPY: write(node->src[1]); break;
+            case GGML_OP_SET_ROWS: write(node->src[2]); break;
+            case GGML_OP_MUL_MAT: case GGML_OP_RMS_NORM: case GGML_OP_MUL:
+            case GGML_OP_ADD: case GGML_OP_CONT: case GGML_OP_CONCAT:
+            case GGML_OP_SOFT_MAX: case GGML_OP_GLU: case GGML_OP_GET_ROWS:
+                break;
+            default:
+                // Until an operator's side effects are audited, include its inputs too.
+                for (const auto * source : node->src) write(source);
+                break;
+        }
+    }
+    ~cann_rope_graph_scope() {
+        ctx.rope_graph_active = false;
+        ctx.rope_graph_caches.clear();
+        // Ownership stays in pending_rope_caches until queued kernels finish.
+    }
+};
+#endif
+
 static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx,
                                             ggml_cgraph *               cgraph,
                                             bool                        use_cann_graph,
                                             bool                        cann_graph_capture_required) {
+#ifdef ASCEND_310P
+    cann_rope_graph_scope rope_scope(*cann_ctx, !use_cann_graph);
+#endif
 #ifdef USE_ACL_GRAPH
     if (use_cann_graph && cann_graph_capture_required) {  // Begin CANN graph capture
         ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
@@ -2560,6 +2617,10 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
             ggml_tensor * node = cgraph->nodes[i];
             if (opt_fusion) {
                 if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
+#ifdef ASCEND_310P
+                    rope_scope.invalidate(node);
+                    rope_scope.invalidate(cgraph->nodes[i + 1]);
+#endif
                     ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
                     i++;
                     continue;
@@ -2575,7 +2636,13 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 continue;
             }
 
+#ifdef ASCEND_310P
+            rope_scope.invalidate(node);
+#endif
             bool ok = ggml_cann_compute_forward(*cann_ctx, node);
+#ifdef ASCEND_310P
+            rope_scope.invalidate(node);
+#endif
             if (!ok) {
                 GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
             }

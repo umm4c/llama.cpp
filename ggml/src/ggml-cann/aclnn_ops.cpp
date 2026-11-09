@@ -1116,7 +1116,12 @@ void ggml_cann_pool2d(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
  * @param acl_dst The destination tensor where the data will be copied to.
  */
 static void cann_copy(ggml_backend_cann_context & ctx, aclTensor * acl_src, aclTensor * acl_dst) {
+#ifdef ASCEND_310P
+    // Let CANN cache repeated launches; GetWorkspaceSize still handles each call's tensors.
+    GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_dst, acl_src);
+#else
     GGML_CANN_CALL_ACLNN_OP_NO_CACHE(ctx, InplaceCopy, acl_dst, acl_src);
+#endif
 }
 
 void ggml_cann_dup(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -2111,9 +2116,7 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 #ifdef ASCEND_310P
                 // Gather the quantized rows first to avoid expanding the entire vocabulary.
                 // Keep Mul's mixed INT8/FP16 inputs to preserve the existing FP16 rounding.
-                const char * gather_first = std::getenv("GGML_CANN_GET_ROWS_GATHER_FIRST");
-                if ((!gather_first || gather_first[0] != '0' || gather_first[1] != '\0') &&
-                    src0->view_src == nullptr && ggml_is_contiguous(src0) &&
+                if (src0->view_src == nullptr && ggml_is_contiguous(src0) &&
                     src0->ne[2] == 1 && src0->ne[3] == 1 &&
                     src1->type == GGML_TYPE_I32 && ggml_is_contiguous(src1) &&
                     src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
@@ -2617,7 +2620,11 @@ static void aclnn_roll(ggml_backend_cann_context & ctx,
                        int64_t *                   dims) {
     acl_int_array_ptr acl_shifts = ggml_cann_create_int_array(shifts, 1);
     acl_int_array_ptr acl_dims   = ggml_cann_create_int_array(dims, 1);
+#ifdef ASCEND_310P
+    GGML_CANN_CALL_ACLNN_OP(ctx, Roll, acl_src, acl_shifts.get(), acl_dims.get(), acl_dst);
+#else
     GGML_CANN_CALL_ACLNN_OP_NO_CACHE(ctx, Roll, acl_src, acl_shifts.get(), acl_dims.get(), acl_dst);
+#endif
 }
 
 /**
@@ -2696,6 +2703,20 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
 
     int64_t theta_scale_length = rope_dims / 2;
     int64_t position_length    = dst->ne[2];
+
+#ifdef ASCEND_310P
+    if (src2 == nullptr && ctx.rope_graph_active) {
+        const ggml_cann_rope_key key(dst, rope_dims);
+        for (auto * cache : ctx.rope_graph_caches) {
+            if (cache->cached && cache->reuse_key && *cache->reuse_key == key) {
+                ctx.active_rope_cache = cache;
+                return;
+            }
+        }
+        ctx.current_rope_cache().reuse_key = key;
+        ctx.rope_graph_caches.push_back(&ctx.current_rope_cache());
+    }
+#endif
 
     // TODO: check theta_scale_length and position_length.
     if (src2 == nullptr && ctx.current_rope_cache().cached &&

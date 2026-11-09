@@ -31,6 +31,8 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <array>
+#include <cstring>
 #include <condition_variable>
 #include <cstdio>
 #include <functional>
@@ -452,7 +454,35 @@ struct ggml_cann_graph_lru_cache {
 };
 #endif  // USE_ACL_GRAPH
 
+#ifdef ASCEND_310P
+struct ggml_cann_rope_key {
+    const ggml_tensor * position;
+    const void * data;
+    int64_t dimensions, tokens;
+    size_t position_bytes;
+    std::array<int64_t, GGML_MAX_DIMS> ne;
+    std::array<size_t, GGML_MAX_DIMS> nb;
+    std::array<char, GGML_MAX_OP_PARAMS> params;
+
+    ggml_cann_rope_key(const ggml_tensor * node, int64_t dimensions) :
+        position(node->src[1]), data(position->data), dimensions(dimensions), tokens(node->ne[2]), position_bytes(ggml_nbytes(position)) {
+        std::memcpy(ne.data(), position->ne, sizeof(position->ne));
+        std::memcpy(nb.data(), position->nb, sizeof(position->nb));
+        // Include all RoPE parameters, including the YaRN correction parameters.
+        std::memcpy(params.data(), node->op_params, GGML_MAX_OP_PARAMS);
+    }
+
+    bool operator==(const ggml_cann_rope_key & other) const {
+        return position == other.position && data == other.data && dimensions == other.dimensions &&
+               tokens == other.tokens && position_bytes == other.position_bytes && ne == other.ne && nb == other.nb && params == other.params;
+    }
+};
+#endif
+
 struct ggml_cann_rope_cache {
+#ifdef ASCEND_310P
+    std::optional<ggml_cann_rope_key> reuse_key;
+#endif
     ~ggml_cann_rope_cache() {
         if (theta_scale_cache) {
             ACL_CHECK(aclrtFree(theta_scale_cache));
@@ -585,6 +615,9 @@ struct ggml_backend_cann_context {
     // overwriting the single shared cache from the next axis.
     ggml_cann_rope_cache * active_rope_cache = nullptr;
     std::vector<std::unique_ptr<ggml_cann_rope_cache>> pending_rope_caches;
+    // Lookup is scoped to one graph submission. Ownership lasts until synchronization.
+    bool rope_graph_active = false;
+    std::vector<ggml_cann_rope_cache *> rope_graph_caches;
 #endif
     // Constant Pool
     ggml_cann_tensor_cache rms_norm_one_tensor_cache;
@@ -614,6 +647,11 @@ struct ggml_backend_cann_context {
         ggml_cann_set_device(device);
 #ifdef ASCEND_310P
         active_rope_cache = nullptr;
+        if (!pending_rope_caches.empty()) {
+            for (auto stream : streams) {
+                if (stream) ACL_CHECK(aclrtSynchronizeStream(stream));
+            }
+        }
         pending_rope_caches.clear();
 #endif
         if (copy_event != nullptr) {
@@ -695,9 +733,12 @@ struct ggml_backend_cann_context {
     void release_pending_rope_caches() {
 #ifdef ASCEND_310P
         active_rope_cache = nullptr;
+        rope_graph_caches.clear();
         pending_rope_caches.clear();
 #endif
     }
+
+
 };
 
 #endif  // CANN_COMMON_H
