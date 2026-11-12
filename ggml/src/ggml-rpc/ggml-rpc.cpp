@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <thread>
+#include <chrono>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -78,6 +79,8 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
     RPC_CMD_NONE,
+    RPC_CMD_PROFILE_BEGIN,
+    RPC_CMD_PROFILE_END,
     RPC_CMD_COUNT,
 };
 
@@ -89,6 +92,21 @@ const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
+
+struct rpc_msg_profile_req {
+    uint64_t window;
+    uint32_t capacity;
+    uint32_t reserved;
+};
+
+struct rpc_msg_profile_header {
+    uint64_t window;
+    uint64_t total;
+    uint32_t count;
+    uint32_t overflow;
+};
+
+static_assert(sizeof(ggml_rpc_profile_record) == 48, "profile record wire layout");
 
 struct rpc_msg_hello_rsp {
     uint8_t major;
@@ -344,7 +362,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t & server_minor) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -360,6 +378,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     }
 
     sock->update_caps(response.conn_caps);
+    server_minor = response.minor;
     return true;
 }
 
@@ -418,6 +437,9 @@ public:
     void event_synchronize(ggml_backend_event_t event);
     void event_record(ggml_backend_event_t event);
     void synchronize();
+    bool profile_begin(uint64_t window, uint32_t capacity);
+    bool profile_end(uint64_t window, ggml_rpc_profile_record * records, uint32_t capacity, uint32_t * count);
+    void profile_submission(uint32_t device, uint32_t n_nodes, bool reused);
 
     void start(const std::string & endpoint);
     void work();
@@ -443,7 +465,63 @@ private:
     socket_ptr       sock;
     std::atomic_bool running;
     std::thread      thread;
+    uint8_t server_minor = 0;
+    uint64_t profile_window = 0;
+    uint32_t profile_capacity = 0;
+    uint64_t profile_total = 0;
+    std::vector<ggml_rpc_profile_record> profile_expected;
 };
+
+static size_t profile_response_size(uint32_t capacity) {
+    return std::max(size_t(4096), sizeof(rpc_msg_profile_header) + size_t(capacity)*sizeof(ggml_rpc_profile_record));
+}
+
+bool rpc_dispatcher::profile_begin(uint64_t window, uint32_t capacity) {
+    if (server_minor < 1 || profile_window || !window || !capacity || capacity > GGML_RPC_PROFILE_MAX_RECORDS) return false;
+    profile_expected.clear();
+    profile_expected.reserve(capacity);
+    profile_window = window;
+    profile_capacity = capacity;
+    profile_total = 0;
+    auto request = std::make_shared<rpc_msg_profile_req>(rpc_msg_profile_req{window, capacity, 0});
+    send_async(RPC_CMD_PROFILE_BEGIN, request, sizeof(*request));
+    return true;
+}
+
+void rpc_dispatcher::profile_submission(uint32_t device, uint32_t n_nodes, bool reused) {
+    if (!profile_window) return;
+    if (profile_expected.size() < profile_capacity) {
+        profile_expected.push_back({profile_total, 0, 0, 0, device, n_nodes, uint32_t(reused), 0});
+    }
+    ++profile_total;
+}
+
+bool rpc_dispatcher::profile_end(uint64_t window, ggml_rpc_profile_record * records, uint32_t capacity, uint32_t * count) {
+    if (!profile_window || profile_window != window || capacity != profile_capacity || !records || !count) return false;
+    auto request = std::make_shared<rpc_msg_profile_req>(rpc_msg_profile_req{window, capacity, 0});
+    std::vector<uint8_t> response(profile_response_size(capacity));
+    send(RPC_CMD_PROFILE_END, request, sizeof(*request), response.data(), response.size());
+    rpc_msg_profile_header header;
+    memcpy(&header, response.data(), sizeof(header));
+    bool valid = header.window == window && header.total == profile_total && header.count == profile_expected.size() && !header.overflow;
+    *count = 0;
+    if (valid) {
+        for (size_t i = 0; i < profile_expected.size(); ++i) {
+            ggml_rpc_profile_record record;
+            memcpy(&record, response.data() + sizeof(header) + i*sizeof(record), sizeof(record));
+            const auto & expected = profile_expected[i];
+            if (record.sequence != expected.sequence || record.device != expected.device || record.n_nodes != expected.n_nodes ||
+                record.reused != expected.reused || record.status != GGML_STATUS_SUCCESS) {
+                valid = false;
+                break;
+            }
+            records[i] = record;
+        }
+        if (valid) *count = header.count;
+    }
+    profile_window = 0;
+    return valid;
+}
 
 static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
 {
@@ -546,7 +624,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
-    if (!negotiate_hello(sock)) {
+    if (!negotiate_hello(sock, server_minor)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -1019,6 +1097,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
+    rpc_ctx->dispatcher->profile_submission(rpc_ctx->device, cgraph->n_nodes, reuse);
     if (reuse) {
         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
         request->device = rpc_ctx->device;
@@ -1031,6 +1110,19 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
     }
     return GGML_STATUS_SUCCESS;
+}
+
+bool ggml_backend_rpc_profile_begin(ggml_backend_t backend, uint64_t window, uint32_t capacity) {
+    if (!ggml_backend_is_rpc(backend)) return false;
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    return ctx->dispatcher->profile_begin(window, capacity);
+}
+
+bool ggml_backend_rpc_profile_end(ggml_backend_t backend, uint64_t window,
+        ggml_rpc_profile_record * records, uint32_t capacity, uint32_t * count) {
+    if (!ggml_backend_is_rpc(backend)) return false;
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    return ctx->dispatcher->profile_end(window, records, capacity, count);
 }
 
 static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -1149,6 +1241,8 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+    bool profile_begin(const rpc_msg_profile_req & request);
+    bool profile_end(const rpc_msg_profile_req & request, std::vector<uint8_t> & response);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
@@ -1172,7 +1266,47 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+    using profile_clock = std::chrono::steady_clock;
+    uint64_t profile_window = 0, profile_total = 0;
+    uint32_t profile_capacity = 0;
+    profile_clock::time_point profile_origin;
+    std::vector<ggml_rpc_profile_record> profile_records;
+    void profile_append(uint32_t device, ggml_cgraph * graph, bool reused, ggml_status status,
+            profile_clock::time_point start, profile_clock::time_point compute_start);
 };
+
+bool rpc_server::profile_begin(const rpc_msg_profile_req & request) {
+    if (profile_window || !request.window || !request.capacity || request.capacity > GGML_RPC_PROFILE_MAX_RECORDS || request.reserved) return false;
+    profile_records.clear();
+    profile_records.reserve(request.capacity);
+    profile_window = request.window;
+    profile_capacity = request.capacity;
+    profile_total = 0;
+    profile_origin = profile_clock::now();
+    return true;
+}
+
+void rpc_server::profile_append(uint32_t device, ggml_cgraph * graph, bool reused, ggml_status status,
+        profile_clock::time_point start, profile_clock::time_point compute_start) {
+    if (!profile_window) return;
+    const auto end = profile_clock::now();
+    auto ns = [](auto duration) { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count()); };
+    if (profile_records.size() < profile_capacity) {
+        profile_records.push_back({profile_total, ns(start-profile_origin), ns(compute_start-start), ns(end-compute_start),
+            device, uint32_t(graph->n_nodes), uint32_t(reused), int32_t(status)});
+    }
+    ++profile_total;
+}
+
+bool rpc_server::profile_end(const rpc_msg_profile_req & request, std::vector<uint8_t> & response) {
+    if (!profile_window || request.window != profile_window || request.capacity != profile_capacity || request.reserved) return false;
+    response.assign(profile_response_size(profile_capacity), 0);
+    rpc_msg_profile_header header{profile_window, profile_total, uint32_t(profile_records.size()), uint32_t(profile_total > profile_capacity)};
+    memcpy(response.data(), &header, sizeof(header));
+    if (!profile_records.empty()) memcpy(response.data() + sizeof(header), profile_records.data(), profile_records.size()*sizeof(ggml_rpc_profile_record));
+    profile_window = 0;
+    return true;
+}
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
@@ -1679,6 +1813,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    const auto profile_start = profile_window ? profile_clock::now() : profile_clock::time_point{};
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t)) {
@@ -1746,13 +1881,16 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
+    const auto compute_start = profile_window ? profile_clock::now() : profile_clock::time_point{};
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    profile_append(device, graph, false, status, profile_start, compute_start);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     stored_graphs[device].graph = graph;
     return true;
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+    const auto profile_start = profile_window ? profile_clock::now() : profile_clock::time_point{};
     uint32_t device = request.device;
     if (device >= backends.size()) {
         return false;
@@ -1762,7 +1900,9 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
+    const auto compute_start = profile_window ? profile_clock::now() : profile_clock::time_point{};
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    profile_append(device, graph, true, status, profile_start, compute_start);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
 }
@@ -2045,6 +2185,18 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
+                break;
+            }
+            case RPC_CMD_PROFILE_BEGIN: {
+                rpc_msg_profile_req request;
+                if (!recv_msg(sock, &request, sizeof(request)) || !server.profile_begin(request)) return;
+                break;
+            }
+            case RPC_CMD_PROFILE_END: {
+                rpc_msg_profile_req request;
+                std::vector<uint8_t> response;
+                if (!recv_msg(sock, &request, sizeof(request)) || !server.profile_end(request, response)) return;
+                if (!send_msg(sock, response.data(), response.size())) return;
                 break;
             }
             default: {

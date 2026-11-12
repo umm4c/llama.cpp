@@ -314,6 +314,11 @@ extern "C" {
             struct ggml_cgraph * graph, bool completed, enum ggml_status status, void * user_data);
     GGML_API void ggml_backend_set_graph_observer(ggml_backend_graph_observer observer, void * user_data);
 
+    // Alternative thread-local observer with no added waits. The after callback
+    // means submission returned, not device completion. Mutually exclusive with
+    // the synchronized observer; callbacks have the same lifetime restrictions.
+    GGML_API void ggml_backend_set_graph_submission_observer(ggml_backend_graph_observer observer, void * user_data);
+
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
     // when ask == true, the scheduler wants to know if the user wants to observe this node
     // this allows the scheduler to batch nodes together in order to evaluate them in a single call
