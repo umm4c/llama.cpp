@@ -460,6 +460,40 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 
 static bool ggml_is_view_op(enum ggml_op op);
 
+static thread_local ggml_backend_graph_observer graph_observer = nullptr;
+static thread_local void * graph_observer_data = nullptr;
+
+void ggml_backend_set_graph_observer(ggml_backend_graph_observer observer, void * user_data) {
+    graph_observer = observer;
+    graph_observer_data = user_data;
+}
+
+// RPC synchronize only drains the client queue. A response-bearing read fences
+// the ordered server stream after GRAPH_COMPUTE without changing its protocol.
+static void ggml_backend_observer_wait(ggml_backend_t backend, struct ggml_cgraph * graph) {
+    ggml_backend_synchronize(backend);
+    auto dev = ggml_backend_get_device(backend);
+    auto reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) return;
+    const char * name = ggml_backend_reg_name(reg);
+    if (strcmp(name, "RPC") != 0 && strncmp(name, "RPC[", 4) != 0) return;
+    struct ggml_tensor * fence = nullptr;
+    for (int i = graph->n_nodes - 1; i >= 0; --i) {
+        auto * tensor = graph->nodes[i];
+        if (tensor->buffer && tensor->data && ggml_nbytes(tensor) &&
+            ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer)) == dev) {
+            if (!fence || ggml_nbytes(tensor) > ggml_nbytes(fence)) fence = tensor;
+            if (ggml_nbytes(fence) >= 4096) break;
+        }
+    }
+    if (fence) {
+        // Tiny responses can incur large transport delays through SSH forwarding.
+        // Bound the read while preferring a full small payload over a one-byte fence.
+        unsigned char bytes[4096];
+        ggml_backend_tensor_get(fence, bytes, 0, std::min(sizeof(bytes), ggml_nbytes(fence)));
+    }
+}
+
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
     if (const char * required = getenv("GGML_REQUIRED_DEVICE")) {
@@ -473,7 +507,13 @@ enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct
             }
         }
     }
-    return backend->iface.graph_compute(backend, cgraph);
+    if (!graph_observer) return backend->iface.graph_compute(backend, cgraph);
+    ggml_backend_observer_wait(backend, cgraph);
+    if (!graph_observer(backend, nullptr, cgraph, false, GGML_STATUS_SUCCESS, graph_observer_data)) return GGML_STATUS_ABORTED;
+    auto status = backend->iface.graph_compute(backend, cgraph);
+    ggml_backend_observer_wait(backend, cgraph);
+    if (!graph_observer(backend, nullptr, cgraph, true, status, graph_observer_data)) return GGML_STATUS_ABORTED;
+    return status;
 }
 
 bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
@@ -2059,7 +2099,21 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    if (!graph_observer) return ggml_backend_sched_compute_splits(sched);
+    for (int i = 0; i < sched->n_backends; ++i) ggml_backend_observer_wait(sched->backends[i], graph);
+    if (!graph_observer(nullptr, sched, graph, false, GGML_STATUS_SUCCESS, graph_observer_data)) return GGML_STATUS_ABORTED;
+    auto status = ggml_backend_sched_compute_splits(sched);
+    for (int i = 0; i < sched->n_backends; ++i) {
+        // Successful child computations already fence their device streams.
+        // Eval callbacks and failed executions may leave additional work queued.
+        if (status == GGML_STATUS_SUCCESS && !sched->callback_eval) {
+            ggml_backend_synchronize(sched->backends[i]);
+        } else {
+            ggml_backend_observer_wait(sched->backends[i], graph);
+        }
+    }
+    if (!graph_observer(nullptr, sched, graph, true, status, graph_observer_data)) return GGML_STATUS_ABORTED;
+    return status;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

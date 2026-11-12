@@ -306,6 +306,14 @@ extern "C" {
 
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
+    // Thread-local opt-in observation. Active observation synchronizes graph submissions.
+    // backend is NULL for scheduler graphs; sched is NULL for direct backend graphs.
+    // The callback must not execute graphs or retain graph/tensor pointers.
+    // Return false to abort; callbacks must not throw across this API.
+    typedef bool (*ggml_backend_graph_observer)(ggml_backend_t backend, ggml_backend_sched_t sched,
+            struct ggml_cgraph * graph, bool completed, enum ggml_status status, void * user_data);
+    GGML_API void ggml_backend_set_graph_observer(ggml_backend_graph_observer observer, void * user_data);
+
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
     // when ask == true, the scheduler wants to know if the user wants to observe this node
     // this allows the scheduler to batch nodes together in order to evaluate them in a single call
