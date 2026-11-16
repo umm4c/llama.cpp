@@ -83,6 +83,28 @@ $ llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052,19
 By default, llama.cpp distributes model weights and the KV cache across all available devices -- both local and remote -- in proportion to each device's available memory.
 You can override this behavior with the `--tensor-split` option and set custom proportions when splitting tensor data across devices.
 
+### Profiling windows (private fork, protocol 6.1)
+
+`ggml_backend_rpc_profile_begin` opens an exclusive, ordered window on a backend's
+endpoint connection. It is asynchronous. `ggml_backend_rpc_profile_end` returns
+all window records in one response and waits for the worker's preceding graph
+computations to finish. Callers provide a capacity between 1 and
+`GGML_RPC_PROFILE_MAX_RECORDS`; overflow or inconsistent records return false.
+Normal inference does not open windows or send these commands.
+
+Records cover both GRAPH_COMPUTE and GRAPH_RECOMPUTE. They contain connection-local
+execution sequence, device, node count, reuse status, preparation time and
+synchronized backend host execution time. The latter includes host submission and
+device waits; it is not kernel time. The worker uses a clock relative to BEGIN;
+its timestamps cannot be subtracted from client timestamps. Recording uses bounded
+in-memory storage and adds no per-graph response or device synchronization.
+
+Windows assume an exclusive caller on the shared endpoint; do not interleave
+unrelated requests while profiling. New clients reject profiling on 6.0 workers
+before sending new commands, while ordinary inference remains available. Old 6.0
+clients reject 6.1 workers during HELLO. Response buffers are at least 4096 bytes
+to avoid the small-response disturbance observed through SSH forwarding.
+
 ### Local cache
 
 The RPC server can use a local cache to store large tensors and avoid transferring them over the network.

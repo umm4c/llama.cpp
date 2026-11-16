@@ -462,10 +462,19 @@ static bool ggml_is_view_op(enum ggml_op op);
 
 static thread_local ggml_backend_graph_observer graph_observer = nullptr;
 static thread_local void * graph_observer_data = nullptr;
+static thread_local ggml_backend_graph_observer graph_submission_observer = nullptr;
+static thread_local void * graph_submission_observer_data = nullptr;
 
 void ggml_backend_set_graph_observer(ggml_backend_graph_observer observer, void * user_data) {
+    GGML_ASSERT(!observer || !graph_submission_observer);
     graph_observer = observer;
     graph_observer_data = user_data;
+}
+
+void ggml_backend_set_graph_submission_observer(ggml_backend_graph_observer observer, void * user_data) {
+    GGML_ASSERT(!observer || !graph_observer);
+    graph_submission_observer = observer;
+    graph_submission_observer_data = user_data;
 }
 
 // RPC synchronize only drains the client queue. A response-bearing read fences
@@ -506,6 +515,12 @@ enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct
                 }
             }
         }
+    }
+    if (graph_submission_observer) {
+        if (!graph_submission_observer(backend, nullptr, cgraph, false, GGML_STATUS_SUCCESS, graph_submission_observer_data)) return GGML_STATUS_ABORTED;
+        auto status = backend->iface.graph_compute(backend, cgraph);
+        if (!graph_submission_observer(backend, nullptr, cgraph, true, status, graph_submission_observer_data)) return GGML_STATUS_ABORTED;
+        return status;
     }
     if (!graph_observer) return backend->iface.graph_compute(backend, cgraph);
     ggml_backend_observer_wait(backend, cgraph);
@@ -2099,6 +2114,12 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
+    if (graph_submission_observer) {
+        if (!graph_submission_observer(nullptr, sched, graph, false, GGML_STATUS_SUCCESS, graph_submission_observer_data)) return GGML_STATUS_ABORTED;
+        auto status = ggml_backend_sched_compute_splits(sched);
+        if (!graph_submission_observer(nullptr, sched, graph, true, status, graph_submission_observer_data)) return GGML_STATUS_ABORTED;
+        return status;
+    }
     if (!graph_observer) return ggml_backend_sched_compute_splits(sched);
     for (int i = 0; i < sched->n_backends; ++i) ggml_backend_observer_wait(sched->backends[i], graph);
     if (!graph_observer(nullptr, sched, graph, false, GGML_STATUS_SUCCESS, graph_observer_data)) return GGML_STATUS_ABORTED;
