@@ -117,6 +117,22 @@ $ bin/ggml-rpc-server -c
 
 By default, the cache is stored in the `$HOME/.cache/llama.cpp/rpc` directory and can be controlled via the `LLAMA_CACHE` environment variable.
 
+### Dynamic uploads (private fork, protocol 6.2)
+
+For uploads larger than 10 MiB, 6.2 clients use the existing backing buffer usage
+as the cache policy. `WEIGHTS` keeps the content-hash lookup and disk cache.
+`DEFAULT` and `COMPUTE` use `SET_TENSOR_NO_CACHE`: the same payload, offsets and
+bounds checks, without client hashing/query or server hashing/file writes. Both
+synchronous and asynchronous uploads follow this rule, including views. Smaller
+uploads keep the existing path. Repeated dynamic data is transmitted again; this
+policy favors changing activations and does not promise a gain over cache hits.
+
+Clients negotiate the worker minor version before using the new command. With
+6.0/6.1 workers they retain the previous upload/cache behavior. Older clients
+reject 6.2 workers during HELLO; deploy matching clients for a new worker. Graph
+serialization, cached recomputation, numerical operations and profile windows
+are unchanged. No cache switch or tensor-name heuristic is required.
+
 ### RDMA transport
 
 The RPC backend can use RDMA instead of TCP for lower latency and higher throughput. The transport is negotiated during the initial handshake -- no changes to command-line usage are required, and the connection falls back to TCP unless both peers can use RDMA.
