@@ -81,6 +81,7 @@ enum rpc_cmd {
     RPC_CMD_NONE,
     RPC_CMD_PROFILE_BEGIN,
     RPC_CMD_PROFILE_END,
+    RPC_CMD_SET_TENSOR_NO_CACHE,
     RPC_CMD_COUNT,
 };
 
@@ -441,6 +442,8 @@ public:
     bool profile_end(uint64_t window, ggml_rpc_profile_record * records, uint32_t capacity, uint32_t * count);
     void profile_submission(uint32_t device, uint32_t n_nodes, bool reused);
 
+    bool supports_uncached_upload() const { return server_minor >= 2; }
+
     void start(const std::string & endpoint);
     void work();
 
@@ -775,10 +778,21 @@ static void ggml_backend_rpc_buffer_memset_tensor(
     ctx->dispatcher->send(RPC_CMD_MEMSET_TENSOR, request, sizeof(*request));
 }
 
+static rpc_cmd tensor_upload_command(const std::shared_ptr<rpc_dispatcher> & dispatcher, const ggml_tensor * tensor, size_t size) {
+    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (size > HASH_THRESHOLD && buffer &&
+        ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        dispatcher->supports_uncached_upload()) {
+        return RPC_CMD_SET_TENSOR_NO_CACHE;
+    }
+    return RPC_CMD_SET_TENSOR;
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    const rpc_cmd command = tensor_upload_command(ctx->dispatcher, tensor, size);
+    if (command == RPC_CMD_SET_TENSOR && size > HASH_THRESHOLD) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -797,7 +811,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     memcpy(input + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input + sizeof(rpc_tensor) + sizeof(offset), data, size);
     std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+    ctx->dispatcher->send(command, input_ptr, input_size);
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -1005,7 +1019,8 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    const rpc_cmd command = tensor_upload_command(ctx->dispatcher, tensor, size);
+    if (command == RPC_CMD_SET_TENSOR && size > HASH_THRESHOLD) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -1025,7 +1040,7 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
     memcpy(input + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input + sizeof(rpc_tensor) + sizeof(offset), data, size);
     std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-    ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+    ctx->dispatcher->send_async(command, input_ptr, input_size);
 }
 
 static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -1235,7 +1250,7 @@ public:
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
-    bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor(const std::vector<uint8_t> & input, bool cache);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1531,7 +1546,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 }
 
 
-bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+bool rpc_server::set_tensor(const std::vector<uint8_t> & input, bool cache) {
     // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
     if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
         return false;
@@ -1569,7 +1584,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     }
 
     const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
-    if (cache_dir && size > HASH_THRESHOLD) {
+    if (cache && cache_dir && size > HASH_THRESHOLD) {
         uint64_t hash = fnv_hash((const uint8_t*)data, size);
         char hash_str[17];
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
@@ -2091,12 +2106,13 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
-            case RPC_CMD_SET_TENSOR: {
+            case RPC_CMD_SET_TENSOR:
+            case RPC_CMD_SET_TENSOR_NO_CACHE: {
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                if (!server.set_tensor(input)) {
+                if (!server.set_tensor(input, cmd == RPC_CMD_SET_TENSOR)) {
                     return;
                 }
                 break;
