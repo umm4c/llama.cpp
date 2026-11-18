@@ -133,6 +133,15 @@ reject 6.2 workers during HELLO; deploy matching clients for a new worker. Graph
 serialization, cached recomputation, numerical operations and profile windows
 are unchanged. No cache switch or tensor-name heuristic is required.
 
+### Graph range timing (private fork, protocol 6.3)
+
+The profiler can queue ordered node boundaries for the next graph, then read
+CANN stream measurements after it completes. BEGIN is asynchronous and FINISH
+returns one bounded response per graph. A fused kernel is reported as a single
+range. Ordinary graph commands and 6.1 timing windows keep their existing layout.
+A 6.3 client skips range timing on older workers. A 6.3 worker needs a matching
+client for HELLO.
+
 ### RDMA transport
 
 The RPC backend can use RDMA instead of TCP for lower latency and higher throughput. The transport is negotiated during the initial handshake -- no changes to command-line usage are required, and the connection falls back to TCP unless both peers can use RDMA.

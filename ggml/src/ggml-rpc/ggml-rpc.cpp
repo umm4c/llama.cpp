@@ -1,6 +1,7 @@
 #include "ggml-rpc.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-timing.h"
 #include "ggml-cpp.h"
 #include "transport.h"
 
@@ -82,6 +83,8 @@ enum rpc_cmd {
     RPC_CMD_PROFILE_BEGIN,
     RPC_CMD_PROFILE_END,
     RPC_CMD_SET_TENSOR_NO_CACHE,
+    RPC_CMD_TIMING_BEGIN,
+    RPC_CMD_TIMING_FINISH,
     RPC_CMD_COUNT,
 };
 
@@ -106,6 +109,17 @@ struct rpc_msg_profile_header {
     uint32_t count;
     uint32_t overflow;
 };
+
+static_assert(sizeof(ggml_backend_timing_sample) == 12, "timing sample wire layout");
+
+struct rpc_timing_finish_req {
+    uint32_t device;
+    uint32_t capacity;
+};
+
+static size_t timing_response_size(size_t capacity) {
+    return std::max(size_t(4096), sizeof(uint32_t) + capacity * sizeof(ggml_backend_timing_sample));
+}
 
 static_assert(sizeof(ggml_rpc_profile_record) == 48, "profile record wire layout");
 
@@ -295,9 +309,9 @@ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
     return sock->recv_data(msg, msg_size);
 }
 
-static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
+static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input, uint64_t limit = UINT64_MAX) {
     uint64_t size;
-    if (!sock->recv_data(&size, sizeof(size))) {
+    if (!sock->recv_data(&size, sizeof(size)) || size > limit) {
         return false;
     }
     try {
@@ -442,6 +456,7 @@ public:
     bool profile_end(uint64_t window, ggml_rpc_profile_record * records, uint32_t capacity, uint32_t * count);
     void profile_submission(uint32_t device, uint32_t n_nodes, bool reused);
 
+    bool supports_timing() const { return server_minor >= 3; }
     bool supports_uncached_upload() const { return server_minor >= 2; }
 
     void start(const std::string & endpoint);
@@ -1140,6 +1155,42 @@ bool ggml_backend_rpc_profile_end(ggml_backend_t backend, uint64_t window,
     return ctx->dispatcher->profile_end(window, records, capacity, count);
 }
 
+static bool rpc_timing_begin(ggml_backend_t backend, const int * ends, size_t count) {
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx->dispatcher->supports_timing() || !ends || !count || count > GGML_RPC_PROFILE_MAX_RECORDS) {
+        return false;
+    }
+    std::vector<uint32_t> words(1 + count);
+    words[0] = ctx->device;
+    for (size_t i = 0; i < count; ++i) {
+        if (ends[i] <= (i ? ends[i - 1] : 0)) {
+            return false;
+        }
+        words[i + 1] = uint32_t(ends[i]);
+    }
+    auto request = std::make_shared<std::vector<uint32_t>>(std::move(words));
+    ctx->dispatcher->send_async(RPC_CMD_TIMING_BEGIN, std::shared_ptr<const void>(request, request->data()),
+                                request->size() * sizeof(uint32_t));
+    return true;
+}
+
+static size_t rpc_timing_finish(ggml_backend_t backend, ggml_backend_timing_sample * output, size_t capacity) {
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx->dispatcher->supports_timing() || capacity > GGML_RPC_PROFILE_MAX_RECORDS) {
+        return 0;
+    }
+    auto request = std::make_shared<rpc_timing_finish_req>(rpc_timing_finish_req{ctx->device, uint32_t(capacity)});
+    std::vector<uint8_t> response(timing_response_size(capacity));
+    ctx->dispatcher->send(RPC_CMD_TIMING_FINISH, request, sizeof(*request), response.data(), response.size());
+    uint32_t count;
+    memcpy(&count, response.data(), sizeof(count));
+    if (!output || count > capacity) {
+        return 0;
+    }
+    memcpy(output, response.data() + sizeof(count), count * sizeof(*output));
+    return count;
+}
+
 static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_ctx->dispatcher->event_record(event);
@@ -1256,6 +1307,8 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+    bool timing_begin(const std::vector<uint8_t> & input);
+    bool timing_finish(const rpc_timing_finish_req & request, std::vector<uint8_t> & response);
     bool profile_begin(const rpc_msg_profile_req & request);
     bool profile_end(const rpc_msg_profile_req & request, std::vector<uint8_t> & response);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
@@ -1281,6 +1334,8 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+    ggml_backend_t timing_backend = nullptr;
+    ggml_backend_timing_finish_t timing_finish_fn = nullptr;
     using profile_clock = std::chrono::steady_clock;
     uint64_t profile_window = 0, profile_total = 0;
     uint32_t profile_capacity = 0;
@@ -1289,6 +1344,57 @@ private:
     void profile_append(uint32_t device, ggml_cgraph * graph, bool reused, ggml_status status,
             profile_clock::time_point start, profile_clock::time_point compute_start);
 };
+
+bool rpc_server::timing_begin(const std::vector<uint8_t> & input) {
+    if (timing_backend || input.size() < 2 * sizeof(uint32_t) || input.size() % sizeof(uint32_t)) {
+        return false;
+    }
+    uint32_t device;
+    memcpy(&device, input.data(), sizeof(device));
+    if (device >= backends.size()) {
+        return false;
+    }
+    std::vector<int> ends(input.size() / sizeof(uint32_t) - 1);
+    for (size_t i = 0; i < ends.size(); ++i) {
+        uint32_t value;
+        memcpy(&value, input.data() + (i + 1) * sizeof(value), sizeof(value));
+        if (!value || value > INT32_MAX || (i && value <= uint32_t(ends[i - 1]))) {
+            return false;
+        }
+        ends[i] = int(value);
+    }
+    auto backend = backends[device];
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (!reg) {
+        return true;
+    }
+    auto begin = (ggml_backend_timing_begin_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_timing_begin_v1");
+    auto finish = (ggml_backend_timing_finish_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_timing_finish_v1");
+    if (begin && finish && begin(backend, ends.data(), ends.size())) {
+        timing_backend = backend;
+        timing_finish_fn = finish;
+    }
+    return true;
+}
+
+bool rpc_server::timing_finish(const rpc_timing_finish_req & request, std::vector<uint8_t> & response) {
+    if (request.device >= backends.size() || request.capacity > GGML_RPC_PROFILE_MAX_RECORDS ||
+        (timing_backend && timing_backend != backends[request.device])) {
+        return false;
+    }
+    uint32_t count = 0;
+    std::vector<ggml_backend_timing_sample> samples(request.capacity);
+    if (timing_backend) {
+        count = timing_finish_fn(timing_backend, samples.data(), samples.size());
+        timing_backend = nullptr;
+    }
+    response.resize(timing_response_size(request.capacity));
+    memcpy(response.data(), &count, sizeof(count));
+    if (count) {
+        memcpy(response.data() + sizeof(count), samples.data(), count * sizeof(samples[0]));
+    }
+    return true;
+}
 
 bool rpc_server::profile_begin(const rpc_msg_profile_req & request) {
     if (profile_window || !request.window || !request.capacity || request.capacity > GGML_RPC_PROFILE_MAX_RECORDS || request.reserved) return false;
@@ -1937,6 +2043,9 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    if (timing_backend) {
+        timing_finish_fn(timing_backend, nullptr, 0);
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -2215,6 +2324,19 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!send_msg(sock, response.data(), response.size())) return;
                 break;
             }
+            case RPC_CMD_TIMING_BEGIN: {
+                std::vector<uint8_t> input;
+                const size_t limit = (GGML_RPC_PROFILE_MAX_RECORDS + 1) * sizeof(uint32_t);
+                if (!recv_msg(sock, input, limit) || !server.timing_begin(input)) return;
+                break;
+            }
+            case RPC_CMD_TIMING_FINISH: {
+                rpc_timing_finish_req request;
+                std::vector<uint8_t> response;
+                if (!recv_msg(sock, &request, sizeof(request)) || !server.timing_finish(request, response) ||
+                    !send_msg(sock, response.data(), response.size())) return;
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -2437,6 +2559,8 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
+    if (std::strcmp(name, "ggml_backend_timing_begin_v1") == 0) return (void *) rpc_timing_begin;
+    if (std::strcmp(name, "ggml_backend_timing_finish_v1") == 0) return (void *) rpc_timing_finish;
     return NULL;
 
     GGML_UNUSED(reg);
