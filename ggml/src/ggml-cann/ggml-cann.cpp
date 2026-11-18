@@ -23,6 +23,7 @@
 #include "ggml-cann.h"
 
 #include "ggml-backend-impl.h"
+#include "ggml-backend-timing.h"
 #include "ggml-cann/aclnn_ops.h"
 #include "ggml-cann/common.h"
 #include "ggml-impl.h"
@@ -39,6 +40,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -2596,10 +2598,91 @@ public:
 };
 #endif
 
+struct cann_timing {
+    ggml_backend_t backend;
+    std::vector<int> boundaries;
+    std::vector<int> recorded;
+    std::vector<aclrtEvent> events;
+    size_t next = 0;
+    bool valid = true;
+
+    ~cann_timing() {
+        for (auto event : events) {
+            if (event) {
+                aclrtDestroyEvent(event);
+            }
+        }
+    }
+
+    void mark(aclrtStream stream, int end) {
+        if (!valid || next == boundaries.size() || boundaries[next] > end) {
+            return;
+        }
+        // A fused launch can cover several requested boundaries.
+        while (next < boundaries.size() && boundaries[next] <= end) {
+            ++next;
+        }
+        valid = aclrtRecordEvent(events[recorded.size()], stream) == ACL_SUCCESS;
+        if (valid) {
+            recorded.push_back(end);
+        }
+    }
+};
+
+static thread_local std::unique_ptr<cann_timing> active_timing;
+
+static bool cann_timing_begin(ggml_backend_t backend, const int * ends, size_t count) {
+    if (active_timing || !ends || !count || count > 65536) {
+        return false;
+    }
+    auto timing = std::make_unique<cann_timing>();
+    timing->backend = backend;
+    timing->boundaries.reserve(count + 1);
+    timing->boundaries.push_back(0);
+    for (size_t i = 0; i < count; ++i) {
+        if (ends[i] <= timing->boundaries.back()) {
+            return false;
+        }
+        timing->boundaries.push_back(ends[i]);
+    }
+    timing->recorded.reserve(count + 1);
+    timing->events.resize(count + 1, nullptr);
+    auto * ctx = static_cast<ggml_backend_cann_context *>(backend->context);
+    ggml_cann_set_device(ctx->device);
+    for (auto & event : timing->events) {
+        if (aclrtCreateEventWithFlag(&event, ACL_EVENT_TIME_LINE) != ACL_SUCCESS) {
+            return false;
+        }
+    }
+    active_timing = std::move(timing);
+    return true;
+}
+
+static size_t cann_timing_finish(ggml_backend_t backend, ggml_backend_timing_sample * output, size_t capacity) {
+    if (!active_timing || active_timing->backend != backend) {
+        return 0;
+    }
+    auto timing = std::move(active_timing);
+    const size_t count = timing->recorded.size();
+    if (!output || !timing->valid || count < 2 || count - 1 > capacity ||
+        timing->next != timing->boundaries.size()) {
+        return 0;
+    }
+    for (size_t i = 1; i < count; ++i) {
+        float elapsed = 0;
+        if (aclrtEventElapsedTime(&elapsed, timing->events[i - 1], timing->events[i]) != ACL_SUCCESS) {
+            elapsed = std::numeric_limits<float>::quiet_NaN();
+        }
+        output[i - 1] = {timing->recorded[i - 1], timing->recorded[i], elapsed};
+    }
+    return count - 1;
+}
+
 static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx,
                                             ggml_cgraph *               cgraph,
                                             bool                        use_cann_graph,
-                                            bool                        cann_graph_capture_required) {
+                                            bool                        cann_graph_capture_required,
+                                            cann_timing *               timing) {
 #ifdef ASCEND_310P
     cann_rope_graph_scope rope_scope(*cann_ctx, !use_cann_graph);
 #endif
@@ -2613,6 +2696,9 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
     static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
 
     if (!use_cann_graph || cann_graph_capture_required) {
+        if (timing) {
+            timing->mark(cann_ctx->stream(), 0);
+        }
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
             if (opt_fusion) {
@@ -2623,16 +2709,25 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 #endif
                     ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
                     i++;
+                    if (timing) {
+                        timing->mark(cann_ctx->stream(), i + 1);
+                    }
                     continue;
                 }
             }
 
             if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
                 node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+                if (timing) {
+                    timing->mark(cann_ctx->stream(), i + 1);
+                }
                 continue;
             }
 
             if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                if (timing) {
+                    timing->mark(cann_ctx->stream(), i + 1);
+                }
                 continue;
             }
 
@@ -2647,6 +2742,9 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
             }
             GGML_ASSERT(ok);
+            if (timing) {
+                timing->mark(cann_ctx->stream(), i + 1);
+            }
         }
     }
 
@@ -2734,7 +2832,12 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
 #else
     bool use_cann_graph = false;
 #endif  // USE_ACL_GRAPH
-    evaluate_and_capture_cann_graph(cann_ctx, cgraph, use_cann_graph, graph_capture_required);
+    auto * timing = active_timing && active_timing->backend == backend ? active_timing.get() : nullptr;
+    if (timing && (use_cann_graph || timing->next != 0 || timing->boundaries.back() != cgraph->n_nodes)) {
+        timing->valid = false;
+        timing = nullptr;
+    }
+    evaluate_and_capture_cann_graph(cann_ctx, cgraph, use_cann_graph, graph_capture_required, timing);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -3336,6 +3439,8 @@ static ggml_backend_dev_t ggml_backend_cann_reg_get_device(ggml_backend_reg_t re
 static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (std::strcmp(name, "ggml_backend_cann_get_transfer_stats_v1") == 0) return (void *) get_transfer_stats_v1;
+    if (std::strcmp(name, "ggml_backend_timing_begin_v1") == 0) return (void *) cann_timing_begin;
+    if (std::strcmp(name, "ggml_backend_timing_finish_v1") == 0) return (void *) cann_timing_finish;
     return nullptr;
 }
 
